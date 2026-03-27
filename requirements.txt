@@ -6,6 +6,7 @@ wheel==0.45.1
 numpy==1.26.4
 scipy==1.13.1
 pandas==2.2.3
+matplotlb==3.10.8
 
 # Intel macOS wheels currently top out at 2.2.2
 torch==2.2.2
