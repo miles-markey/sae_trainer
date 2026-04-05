@@ -6,18 +6,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-def evaluate(model, loader, device, lambda_l1=1e-4, mass_frac_threshold=0.01):
+from .model_utils import firing_rate_kl_loss
+
+
+def evaluate(
+    model,
+    loader,
+    device,
+    lambda_l1=1e-4,
+    mass_frac_threshold=0.01,
+    lambda_kl: float = 0.0,
+    target_firing_rate: float = 0.01,
+):
     model.eval()
-    total_loss, total_recon, total_l1, total_active, n = 0.0, 0.0, 0.0, 0.0, 0
+    total_loss, total_recon, total_l1, total_kl, total_active, n = (
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0,
+    )
 
     with torch.no_grad():
         for (xb,) in loader:
             xb = xb.to(device, non_blocking=True)
-            x_hat, z = model(xb)
+            if lambda_kl > 0:
+                x_hat, z, h = model(xb, return_pre_relu=True)
+                kl = firing_rate_kl_loss(h, target_firing_rate)
+            else:
+                x_hat, z = model(xb)
+                kl = torch.zeros((), device=device)
 
             recon = F.mse_loss(x_hat, xb)
             l1 = z.abs().mean()
-            loss = recon + lambda_l1 * l1
+            loss = recon + lambda_l1 * l1 + lambda_kl * kl
 
             az = z.abs()
             row_sum = az.sum(dim=1, keepdim=True).clamp(min=1e-8)
@@ -29,33 +52,63 @@ def evaluate(model, loader, device, lambda_l1=1e-4, mass_frac_threshold=0.01):
             total_loss += loss.item() * bs
             total_recon += recon.item() * bs
             total_l1 += l1.item() * bs
+            total_kl += kl.item() * bs
             total_active += active.item() * bs
             n += bs
 
-    return {
+    out = {
         "loss": total_loss / n,
         "recon": total_recon / n,
         "l1": total_l1 / n,
         "active": total_active / n,
     }
+    out["kl"] = total_kl / n if lambda_kl > 0 else 0.0
+    return out
 
-def train_sae(sae, train_loader, val_loader, opt, scheduler, device, lambda_l1=1e-4, show_curves=True, mass_frac_threshold=0.01):
+def train_sae(
+    sae,
+    train_loader,
+    val_loader,
+    opt,
+    scheduler,
+    device,
+    lambda_l1=1e-4,
+    show_curves=True,
+    mass_frac_threshold=0.01,
+    lambda_kl: float = 0.0,
+    target_firing_rate: float = 0.01,
+):
 
     epochs = 20
-    history = {"train_loss": [], "train_recon": [], "train_l1": [],
-               "val_loss": [], "val_recon": [], "val_l1": [], "val_active": []}
+    history = {
+        "train_loss": [],
+        "train_recon": [],
+        "train_l1": [],
+        "train_kl": [],
+        "val_loss": [],
+        "val_recon": [],
+        "val_l1": [],
+        "val_kl": [],
+        "val_active": [],
+    }
 
     for epoch in range(1, epochs + 1):
         sae.train()
-        running_loss, running_recon, running_l1, seen = 0.0, 0.0, 0.0, 0
+        running_loss, running_recon, running_l1, running_kl, seen = 0.0, 0.0, 0.0, 0.0, 0
 
         for (xb,) in train_loader:
             xb = xb.to(device, non_blocking=True)
 
-            x_hat, z = sae(xb)
+            if lambda_kl > 0:
+                x_hat, z, h = sae(xb, return_pre_relu=True)
+                kl = firing_rate_kl_loss(h, target_firing_rate)
+            else:
+                x_hat, z = sae(xb)
+                kl = torch.zeros((), device=device)
+
             recon = F.mse_loss(x_hat, xb)
             l1 = z.abs().mean()
-            loss = recon + lambda_l1 * l1
+            loss = recon + lambda_l1 * l1 + lambda_kl * kl
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -66,6 +119,7 @@ def train_sae(sae, train_loader, val_loader, opt, scheduler, device, lambda_l1=1
             running_loss += loss.item() * bs
             running_recon += recon.item() * bs
             running_l1 += l1.item() * bs
+            running_kl += kl.item() * bs
             seen += bs
 
         scheduler.step()
@@ -74,20 +128,36 @@ def train_sae(sae, train_loader, val_loader, opt, scheduler, device, lambda_l1=1
             "loss": running_loss / seen,
             "recon": running_recon / seen,
             "l1": running_l1 / seen,
+            "kl": running_kl / seen,
         }
-        val_metrics = evaluate(sae, val_loader, device, lambda_l1=lambda_l1, mass_frac_threshold=mass_frac_threshold)
+        val_metrics = evaluate(
+            sae,
+            val_loader,
+            device,
+            lambda_l1=lambda_l1,
+            mass_frac_threshold=mass_frac_threshold,
+            lambda_kl=lambda_kl,
+            target_firing_rate=target_firing_rate,
+        )
 
         history["train_loss"].append(train_metrics["loss"])
         history["train_recon"].append(train_metrics["recon"])
         history["train_l1"].append(train_metrics["l1"])
+        history["train_kl"].append(train_metrics["kl"])
         history["val_loss"].append(val_metrics["loss"])
         history["val_recon"].append(val_metrics["recon"])
         history["val_l1"].append(val_metrics["l1"])
+        history["val_kl"].append(val_metrics["kl"])
         history["val_active"].append(val_metrics["active"])
 
+        kl_str = (
+            f", kl {train_metrics['kl']:.6f} / {val_metrics['kl']:.6f}"
+            if lambda_kl > 0
+            else ""
+        )
         print(
             f"Epoch {epoch:02d} | "
-            f"train loss {train_metrics['loss']:.6f} (recon {train_metrics['recon']:.6f}, l1 {train_metrics['l1']:.6f}) | "
+            f"train loss {train_metrics['loss']:.6f} (recon {train_metrics['recon']:.6f}, l1 {train_metrics['l1']:.6f}{kl_str}) | "
             f"val loss {val_metrics['loss']:.6f} (recon {val_metrics['recon']:.6f}, l1 {val_metrics['l1']:.6f}) | "
             f"val active {val_metrics['active']:.1f}"
         )
