@@ -1,6 +1,8 @@
 .python-version
 .venv/
+.vscode/
 .env
 *.pt
 .DS_Store
 **/__pycache__/
+**/scratch_work.py

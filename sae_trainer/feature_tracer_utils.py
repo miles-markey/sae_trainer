@@ -10,9 +10,11 @@ class TraceConfig:
     layer_idx: int
     topk_per_token: int = 8
     min_activation: float = 0.0
-    max_new_tokens: int = 80
+    max_new_tokens: int = 20
     do_sample: bool = True
-    temperature: float = 0.7
+    temperature: float = 0.2
+    repetition_penalty: float = 1.0   # >1 discourages repetition; 1.3-1.5 works well for GPT-2
+    stop_strings: Optional[List[str]] = None  # e.g. ["\n"] to stop at first newline
     context_window: int = 8
 
 
@@ -42,9 +44,21 @@ class FeatureTracer:
         h = output[0] if isinstance(output, tuple) else output
         self._captured_hidden.append(h.detach())
 
+    def _get_layer(self, idx: int):
+        # GPT-2 style: model.transformer.h[i]
+        if hasattr(self.llm, "transformer") and hasattr(self.llm.transformer, "h"):
+            return self.llm.transformer.h[idx]
+        # LLaMA / Qwen style: model.model.layers[i]
+        if hasattr(self.llm, "model") and hasattr(self.llm.model, "layers"):
+            return self.llm.model.layers[idx]
+        raise AttributeError(
+            f"Cannot find layer list on {type(self.llm).__name__}. "
+            "Expected `model.transformer.h` (GPT-2) or `model.model.layers` (LLaMA/Qwen)."
+        )
+
     def _register_hook(self):
         self._remove_hook()
-        layer = self.llm.model.layers[self.cfg.layer_idx]
+        layer = self._get_layer(self.cfg.layer_idx)
         self._hook_handle = layer.register_forward_hook(self._hook_fn)
 
     def _remove_hook(self):
@@ -56,20 +70,39 @@ class FeatureTracer:
         self._captured_hidden.clear()
         self._rows.clear()
 
+    # ---------- Input formatting ----------
+    def _format_inputs(self, prompt: str, system_prompt: Optional[str]) -> Dict:
+        if system_prompt is not None and getattr(self.tokenizer, "chat_template", None) is not None:
+            messages = [{"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}]
+            input_ids = self.tokenizer.apply_chat_template(
+                messages, return_tensors="pt", add_generation_prompt=True
+            ).to(self.device)
+            return {"input_ids": input_ids}
+        # Fallback for models without a chat template (e.g. GPT-2 base)
+        text = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+        return self.tokenizer(text, return_tensors="pt").to(self.device)
+
     # ---------- Core tracing ----------
     @torch.no_grad()
-    def trace_prompt(self, prompt: str, prompt_id: Optional[str] = None) -> Dict:
+    def trace_prompt(self, prompt: str, prompt_id: Optional[str] = None, system_prompt: Optional[str] = None, exclude_prompt_tokens: bool = True) -> Dict:
         self._captured_hidden = []
         self._register_hook()
 
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        out = self.llm.generate(
-            **inputs,
+        inputs = self._format_inputs(prompt, system_prompt)
+        num_prompt_tokens = inputs["input_ids"].shape[1]
+        generate_kwargs = dict(
             max_new_tokens=self.cfg.max_new_tokens,
             do_sample=self.cfg.do_sample,
-            temperature=self.cfg.temperature,
+            repetition_penalty=self.cfg.repetition_penalty,
             pad_token_id=self.tokenizer.eos_token_id,
         )
+        if self.cfg.do_sample:
+            generate_kwargs["temperature"] = self.cfg.temperature
+        if self.cfg.stop_strings:
+            generate_kwargs["stop_strings"] = self.cfg.stop_strings
+            generate_kwargs["tokenizer"] = self.tokenizer
+        out = self.llm.generate(**inputs, **generate_kwargs)
 
         self._remove_hook()
 
@@ -98,6 +131,8 @@ class FeatureTracer:
         pid = prompt_id if prompt_id is not None else str(len(self._rows))
 
         for pos in range(min(len(tokens), Z.shape[0])):
+            if exclude_prompt_tokens and pos < num_prompt_tokens:
+                continue
             for j in range(top_idx.shape[1]):
                 val = float(top_vals[pos, j])
                 if val <= self.cfg.min_activation:
@@ -119,15 +154,16 @@ class FeatureTracer:
             "prompt_id": pid,
             "prompt": prompt,
             "generated_text": text,
+            "num_prompt_tokens": num_prompt_tokens,
             "num_tokens": len(tokens),
             "num_hits": sum(1 for r in self._rows if r["prompt_id"] == pid),
         }
 
-    def trace_prompts(self, prompts: List[str], ids: Optional[List[str]] = None) -> List[Dict]:
+    def trace_prompts(self, prompts: List[str], ids: Optional[List[str]] = None, system_prompt: Optional[str] = None, exclude_prompt_tokens: bool = True) -> List[Dict]:
         summaries = []
         for i, p in enumerate(prompts):
             pid = ids[i] if ids is not None else f"p{i}"
-            summaries.append(self.trace_prompt(p, prompt_id=pid))
+            summaries.append(self.trace_prompt(p, prompt_id=pid, system_prompt=system_prompt, exclude_prompt_tokens=exclude_prompt_tokens))
         return summaries
 
     # ---------- Analysis ----------
@@ -141,8 +177,53 @@ class FeatureTracer:
             )
         return pd.DataFrame(self._rows)
 
-    def top_features(self, n: int = 25) -> pd.DataFrame:
+    def _expand_token_variants(self, tokens: List[str]) -> List[str]:
+        """Add BPE prefix variants so callers don't need to know the tokenizer's prefix char."""
+        expanded = set()
+        for t in tokens:
+            expanded.add(t)
+            expanded.add("Ġ" + t)   # GPT-2 / RoBERTa word-initial prefix
+            expanded.add("▁" + t)   # SentencePiece word-initial prefix
+            expanded.add(t.lstrip("Ġ▁"))  # strip prefix if caller passed it
+        return list(expanded)
+
+    def token_positions(
+        self,
+        tokens: List[str],
+        prompt_id: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Return a DataFrame of (prompt_id, token_pos, token) for every occurrence
+        of the requested token strings, useful for deciding what to filter on."""
         df = self.to_dataframe()
+        if prompt_id is not None:
+            df = df[df["prompt_id"] == prompt_id]
+        mask = df["token"].isin(self._expand_token_variants(tokens))
+        return (
+            df[mask][["prompt_id", "token_pos", "token"]]
+            .drop_duplicates()
+            .sort_values(["prompt_id", "token_pos"])
+            .reset_index(drop=True)
+        )
+
+    def _apply_token_filter(
+        self,
+        df: pd.DataFrame,
+        tokens: Optional[List[str]],
+        token_pos: Optional[List[int]],
+    ) -> pd.DataFrame:
+        if tokens is not None:
+            df = df[df["token"].isin(self._expand_token_variants(tokens))]
+        if token_pos is not None:
+            df = df[df["token_pos"].isin(token_pos)]
+        return df
+
+    def top_features(
+        self,
+        n: int = 25,
+        tokens: Optional[List[str]] = None,
+        token_pos: Optional[List[int]] = None,
+    ) -> pd.DataFrame:
+        df = self._apply_token_filter(self.to_dataframe(), tokens, token_pos)
         if df.empty:
             return df
         out = (
@@ -162,10 +243,12 @@ class FeatureTracer:
         self,
         feature_id: int,
         top_n: int = 15,
-        window: Optional[int] = None
+        window: Optional[int] = None,
+        tokens: Optional[List[str]] = None,
+        token_pos: Optional[List[int]] = None,
     ) -> pd.DataFrame:
         w = self.cfg.context_window if window is None else window
-        df = self.to_dataframe()
+        df = self._apply_token_filter(self.to_dataframe(), tokens, token_pos)
         if df.empty:
             return pd.DataFrame()
 
