@@ -166,6 +166,27 @@ class FeatureTracer:
             summaries.append(self.trace_prompt(p, prompt_id=pid, system_prompt=system_prompt, exclude_prompt_tokens=exclude_prompt_tokens))
         return summaries
 
+    def trace_prompts_from_iterable_dataset(
+            self,
+            ds,
+            min_prompt_words: int = 50,
+            truncation_limit: int = 150,
+            max_prompts_to_trace: Optional[int] = None,
+            system_prompt: Optional[str] = None,
+            exclude_prompt_tokens: bool = True,
+        ) -> List[Dict]:
+        summaries = []
+        num_traced = 0
+        for row in ds:
+            text = row["text"].strip()
+            if len(text.split()) >= min_prompt_words:
+                summaries.append(self.trace_prompt(" ".join(text.split()[:truncation_limit]), prompt_id=num_traced, system_prompt=system_prompt, exclude_prompt_tokens=exclude_prompt_tokens))
+                num_traced += 1
+            if max_prompts_to_trace and num_traced >= max_prompts_to_trace:
+                break
+        return summaries
+
+
     # ---------- Analysis ----------
     def to_dataframe(self) -> pd.DataFrame:
         if not self._rows:
@@ -271,6 +292,154 @@ class FeatureTracer:
                 }
             )
         return pd.DataFrame(rows)
+
+    def compute_feature_embeddings(
+        self,
+        feature_ids: Optional[List[int]] = None,
+        contexts_per_feature: int = 50,
+        model_name: str = "all-MiniLM-L6-v2",
+        batch_size: int = 64,
+    ) -> Dict[int, Dict]:
+        """
+        For each feature, embed its top activating context windows using a
+        sentence-transformer model.
+
+        Returns a dict keyed by feature_id:
+          {
+            "embeddings": np.ndarray [n, d],   # one row per context
+            "activations": np.ndarray [n],     # corresponding activation values
+            "contexts": List[str],             # decoded context strings
+          }
+        """
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            raise ImportError("pip install sentence-transformers")
+
+        import numpy as np
+
+        embed_model = SentenceTransformer(model_name)
+
+        df = self.to_dataframe()
+        if feature_ids is None:
+            feature_ids = df["feature_id"].unique().tolist()
+
+        results = {}
+        for fid in feature_ids:
+            ctx_df = self.feature_contexts(fid, top_n=contexts_per_feature)
+            if ctx_df.empty:
+                continue
+
+            contexts = ctx_df["context"].tolist()
+            activations = ctx_df["activation"].to_numpy()
+            prompt_ids = ctx_df["prompt_id"].tolist()
+            token_positions = ctx_df["token_pos"].to_numpy()
+
+            embeddings = embed_model.encode(
+                contexts,
+                batch_size=batch_size,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=True,  # unit-norm so cosine sim = dot product
+            )
+
+            results[fid] = {
+                "embeddings": embeddings,
+                "activations": activations,
+                "contexts": contexts,
+                "prompt_ids": prompt_ids,
+                "token_positions": token_positions,
+            }
+
+        return results
+
+    def feature_specificity_scores(
+        self,
+        feature_embeddings: Optional[Dict] = None,
+        feature_ids: Optional[List[int]] = None,
+        contexts_per_feature: int = 50,
+        model_name: str = "all-MiniLM-L6-v2",
+        weighted: bool = True,
+        mask_same_context: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Compute a specificity score for each feature as the mean pairwise cosine
+        similarity of its activating context embeddings, optionally weighted by
+        activation strength.
+
+        Also computes a baseline (mean similarity of randomly sampled context pairs
+        across all features) so scores can be interpreted relatively.
+
+        Returns a DataFrame with columns:
+          feature_id, hits, mean_activation, specificity, specificity_vs_baseline
+        """
+        import numpy as np
+
+        if feature_embeddings is None:
+            feature_embeddings = self.compute_feature_embeddings(
+                feature_ids=feature_ids,
+                contexts_per_feature=contexts_per_feature,
+                model_name=model_name,
+            )
+
+        def _weighted_mean_cosine(
+            embeddings: "np.ndarray",
+            weights: "np.ndarray",
+            valid_pairs_mask: "np.ndarray",  # [n, n] bool — True = include this pair
+        ) -> float:
+            # embeddings are already unit-normed, so dot product == cosine similarity
+            sim_matrix = embeddings @ embeddings.T  # [n, n]
+            n = len(weights)
+            if n < 2:
+                return float("nan")
+            w_outer = weights[:, None] * weights[None, :]
+            # Exclude diagonal (self-similarity) and any masked pairs
+            include = valid_pairs_mask & ~np.eye(n, dtype=bool)
+            if include.sum() == 0:
+                return float("nan")
+            return float((sim_matrix[include] * w_outer[include]).sum() / w_outer[include].sum())
+
+        # Compute per-feature scores
+        rows = []
+        for fid, data in feature_embeddings.items():
+            emb = data["embeddings"]
+            acts = data["activations"]
+            n = len(acts)
+            weights = acts / (acts.sum() + 1e-8) if weighted else np.ones(n) / n
+
+            if mask_same_context and "prompt_ids" in data:
+                pids = np.array(data["prompt_ids"])
+                tpos = data["token_positions"]
+                w = self.cfg.context_window
+                # Mask out pairs from the same prompt whose windows overlap
+                same_prompt = pids[:, None] == pids[None, :]
+                close_pos = np.abs(tpos[:, None] - tpos[None, :]) <= (2 * w)
+                valid_pairs_mask = ~(same_prompt & close_pos)
+            else:
+                valid_pairs_mask = np.ones((n, n), dtype=bool)
+
+            score = _weighted_mean_cosine(emb, weights, valid_pairs_mask)
+            rows.append({
+                "feature_id": fid,
+                "hits": len(acts),
+                "mean_activation": float(acts.mean()),
+                "specificity": score,
+            })
+
+        result_df = pd.DataFrame(rows)
+        if result_df.empty:
+            return result_df
+
+        # Baseline: mean cosine sim between random context pairs across all features
+        all_embeddings = np.concatenate([d["embeddings"] for d in feature_embeddings.values()])
+        rng = np.random.default_rng(42)
+        n_baseline = min(1000, len(all_embeddings))
+        idx = rng.choice(len(all_embeddings), size=(n_baseline, 2))
+        baseline = float((all_embeddings[idx[:, 0]] * all_embeddings[idx[:, 1]]).sum(axis=1).mean())
+
+        result_df["specificity_vs_baseline"] = result_df["specificity"] - baseline
+        result_df = result_df.sort_values("specificity_vs_baseline", ascending=False).reset_index(drop=True)
+        return result_df
 
     def save_csv(self, path: str):
         self.to_dataframe().to_csv(path, index=False)
