@@ -38,6 +38,7 @@ class FeatureTracer:
         self._hook_handle = None
         self._captured_hidden: List[torch.Tensor] = []
         self._rows: List[dict] = []
+        self._feature_embeddings = None
 
     # ---------- Hooking ----------
     def _hook_fn(self, module, inputs, output):
@@ -69,6 +70,7 @@ class FeatureTracer:
     def reset(self):
         self._captured_hidden.clear()
         self._rows.clear()
+        self._feature_embeddings = None
 
     # ---------- Input formatting ----------
     def _format_inputs(self, prompt: str, system_prompt: Optional[str]) -> Dict:
@@ -102,6 +104,7 @@ class FeatureTracer:
         if self.cfg.stop_strings:
             generate_kwargs["stop_strings"] = self.cfg.stop_strings
             generate_kwargs["tokenizer"] = self.tokenizer
+        torch.manual_seed(hash(prompt_id) % (2**32)) # Set seed for reproducability
         out = self.llm.generate(**inputs, **generate_kwargs)
 
         self._remove_hook()
@@ -355,7 +358,7 @@ class FeatureTracer:
 
     def feature_specificity_scores(
         self,
-        feature_embeddings: Optional[Dict] = None,
+        #feature_embeddings: Optional[Dict] = None,
         feature_ids: Optional[List[int]] = None,
         contexts_per_feature: int = 50,
         model_name: str = "all-MiniLM-L6-v2",
@@ -375,8 +378,8 @@ class FeatureTracer:
         """
         import numpy as np
 
-        if feature_embeddings is None:
-            feature_embeddings = self.compute_feature_embeddings(
+        if self._feature_embeddings is None:
+            self._feature_embeddings = self.compute_feature_embeddings(
                 feature_ids=feature_ids,
                 contexts_per_feature=contexts_per_feature,
                 model_name=model_name,
@@ -401,7 +404,7 @@ class FeatureTracer:
 
         # Compute per-feature scores
         rows = []
-        for fid, data in feature_embeddings.items():
+        for fid, data in self._feature_embeddings.items():
             emb = data["embeddings"]
             acts = data["activations"]
             n = len(acts)
@@ -431,7 +434,7 @@ class FeatureTracer:
             return result_df
 
         # Baseline: mean cosine sim between random context pairs across all features
-        all_embeddings = np.concatenate([d["embeddings"] for d in feature_embeddings.values()])
+        all_embeddings = np.concatenate([d["embeddings"] for d in self._feature_embeddings.values()])
         rng = np.random.default_rng(42)
         n_baseline = min(1000, len(all_embeddings))
         idx = rng.choice(len(all_embeddings), size=(n_baseline, 2))
@@ -441,5 +444,8 @@ class FeatureTracer:
         result_df = result_df.sort_values("specificity_vs_baseline", ascending=False).reset_index(drop=True)
         return result_df
 
+    def get_feature_embeddings(self):
+        return self._feature_embeddings
+    
     def save_csv(self, path: str):
         self.to_dataframe().to_csv(path, index=False)

@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import html as html_lib
 from IPython.display import HTML, display as ipy_display
+# import umap
 from .feature_tracer_utils import FeatureTracer
 
 def top_n_feats_by_hits_count(tracer: FeatureTracer, top_n=30):
@@ -197,3 +198,241 @@ def render_feature_card(
     fig.suptitle(f"Feature #{feature_id}{scope_label}", fontsize=10, color="#888")
     plt.tight_layout()
     plt.show()
+
+def plot_feature_umap(
+    tracer,
+    top_n: int = 20,           # restrict to top-N features by specificity to keep plot readable
+    random_state: int = 42,
+    figsize=(16, 7),
+):
+    """
+    Two side-by-side UMAP plots:
+
+    Left — Token-level: each point is one context window embedding, colored by feature_id.
+           Shows whether each feature's activating contexts cluster tightly.
+
+    Right — Centroid-level: each point is one feature (mean embedding).
+            Point size = hit count, color = specificity_vs_baseline (if scores provided).
+            Shows the broader feature landscape and how features relate to each other.
+    """
+
+    # --- Usage ---
+    # scores = tracer.feature_specificity_scores(feature_embeddings=embeddings)
+    # plot_feature_umap(embeddings, specificity_scores=scores, top_n=20)
+    specificity_scores = tracer.feature_specificity_scores()
+    feature_embeddings = tracer.get_feature_embeddings()
+
+
+    # Select features to plot
+    if specificity_scores is not None and not specificity_scores.empty:
+        top_fids = specificity_scores.head(top_n)["feature_id"].tolist()
+    else:
+        # Fall back to top-N by hit count
+        top_fids = sorted(
+            feature_embeddings.keys(),
+            key=lambda fid: len(feature_embeddings[fid]["activations"]),
+            reverse=True,
+        )[:top_n]
+
+    selected = {fid: feature_embeddings[fid] for fid in top_fids if fid in feature_embeddings}
+    if not selected:
+        print("No features to plot.")
+        return
+
+    # --- Build token-level arrays ---
+    all_embs, all_labels = [], []
+    for fid, data in selected.items():
+        all_embs.append(data["embeddings"])
+        all_labels.extend([fid] * len(data["embeddings"]))
+
+    all_embs = np.concatenate(all_embs, axis=0)
+    all_labels = np.array(all_labels)
+
+    # --- Fit a single UMAP on all token embeddings ---
+    reducer = umap.UMAP(n_components=2, random_state=random_state, metric="cosine")
+    token_2d = reducer.fit_transform(all_embs)
+
+    # Compute centroids in 2D for the centroid plot
+    centroids_2d = np.array([
+        token_2d[all_labels == fid].mean(axis=0) for fid in top_fids
+    ])
+
+    # Color palette — one color per feature
+    palette = cm.get_cmap("tab20", len(top_fids))
+    color_map = {fid: palette(i) for i, fid in enumerate(top_fids)}
+    colors = [color_map[fid] for fid in all_labels]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+
+    # --- Left: token-level ---
+    ax1.scatter(token_2d[:, 0], token_2d[:, 1], c=colors, s=8, alpha=0.6, linewidths=0)
+    # Label each cluster at its centroid
+    for i, fid in enumerate(top_fids):
+        ax1.annotate(
+            str(fid), centroids_2d[i],
+            fontsize=7, ha="center", va="center",
+            fontweight="bold", color=color_map[fid],
+        )
+    ax1.set_title(f"Token-level embeddings (top {len(top_fids)} features)", fontsize=11)
+    ax1.set_xlabel("UMAP-1")
+    ax1.set_ylabel("UMAP-2")
+    ax1.axis("off")
+
+    # --- Right: centroid-level ---
+    hit_counts = np.array([len(selected[fid]["activations"]) for fid in top_fids])
+    marker_sizes = 50 + 200 * (hit_counts / hit_counts.max())  # scale dot size by hits
+
+    if specificity_scores is not None and "specificity_vs_baseline" in specificity_scores.columns:
+        score_map = specificity_scores.set_index("feature_id")["specificity_vs_baseline"]
+        spec_values = np.array([score_map.get(fid, 0.0) for fid in top_fids])
+        sc = ax2.scatter(
+            centroids_2d[:, 0], centroids_2d[:, 1],
+            s=marker_sizes, c=spec_values, cmap="RdYlGn",
+            alpha=0.85, linewidths=0.5, edgecolors="grey",
+        )
+        plt.colorbar(sc, ax=ax2, label="specificity_vs_baseline")
+    else:
+        centroid_colors = [color_map[fid] for fid in top_fids]
+        ax2.scatter(
+            centroids_2d[:, 0], centroids_2d[:, 1],
+            s=marker_sizes, c=centroid_colors, alpha=0.85,
+            linewidths=0.5, edgecolors="grey",
+        )
+
+    for i, fid in enumerate(top_fids):
+        ax2.annotate(str(fid), centroids_2d[i], fontsize=7, ha="center", va="bottom")
+
+    ax2.set_title(f"Feature centroids (size = hits, color = specificity)", fontsize=11)
+    ax2.set_xlabel("UMAP-1")
+    ax2.set_ylabel("UMAP-2")
+    ax2.axis("off")
+
+    plt.suptitle("Feature Embedding Landscape", fontsize=13, y=1.01)
+    plt.tight_layout()
+    plt.show()
+
+def compute_inter_feature_similarity(feature_embeddings: dict) -> tuple[np.ndarray, list]:
+    """
+    Compute pairwise cosine similarity between feature centroids.
+
+    Each feature's centroid is the mean of its context window embeddings
+    (already unit-normed, so mean then re-normalize gives the centroid direction).
+
+    Returns:
+        sim_matrix: np.ndarray [n_features, n_features] of cosine similarities
+        feature_ids: list of feature IDs corresponding to matrix rows/cols
+    """
+    feature_ids = list(feature_embeddings.keys())
+
+    centroids = []
+    for fid in feature_ids:
+        emb = feature_embeddings[fid]["embeddings"]  # [n, d], unit-normed
+        centroid = emb.mean(axis=0)
+        # Re-normalize so centroid is also unit-length for valid cosine sim
+        centroid = centroid / (np.linalg.norm(centroid) + 1e-8)
+        centroids.append(centroid)
+
+    centroids = np.stack(centroids)           # [n_features, d]
+    sim_matrix = centroids @ centroids.T      # [n_features, n_features]
+
+    return sim_matrix, feature_ids
+
+
+def plot_inter_feature_similarity(
+    tracer,
+    top_n: int = 30,            # restrict to top-N features by specificity
+    figsize=(12, 10),
+    annot_threshold: float = 0.5,  # annotate cells above this similarity value
+):
+    """
+    Heatmap of pairwise cosine similarity between feature centroids.
+
+    Features are ordered by specificity_vs_baseline (if provided) so that the
+    most interpretable features appear top-left.  Off-diagonal cells with high
+    similarity indicate potentially redundant features.
+    """
+
+    # --- Usage ---
+    # scores = tracer.feature_specificity_scores()
+    # embeddings = tracer.get_feature_embeddings()
+    #
+    # sim_matrix, fids = plot_inter_feature_similarity(
+    #     embeddings,
+    #     specificity_scores=scores,
+    #     top_n=30,
+    #     annot_threshold=0.5,  
+    # )
+    # Select and order features
+
+    specificity_scores = tracer.feature_specificity_scores()
+    feature_embeddings = tracer.get_feature_embeddings()
+
+    if specificity_scores is not None and not specificity_scores.empty:
+        ordered_fids = specificity_scores.head(top_n)["feature_id"].tolist()
+        ordered_fids = [fid for fid in ordered_fids if fid in feature_embeddings]
+    else:
+        ordered_fids = sorted(
+            feature_embeddings.keys(),
+            key=lambda fid: len(feature_embeddings[fid]["activations"]),
+            reverse=True,
+        )[:top_n]
+
+    subset = {fid: feature_embeddings[fid] for fid in ordered_fids}
+    sim_matrix, feature_ids = compute_inter_feature_similarity(subset)
+
+    # Build labels — feature_id plus hit count for context
+    labels = [
+        f"{fid}\n(n={len(feature_embeddings[fid]['activations'])})"
+        for fid in feature_ids
+    ]
+
+    sim_df = pd.DataFrame(sim_matrix, index=labels, columns=labels)
+
+    # Annotation mask — only annotate high-similarity off-diagonal cells
+    annot = np.where(
+        (sim_matrix >= annot_threshold) & ~np.eye(len(feature_ids), dtype=bool),
+        np.round(sim_matrix, 2).astype(str),
+        "",
+    )
+
+    _, ax = plt.subplots(figsize=figsize)
+    sns.heatmap(
+        sim_df,
+        ax=ax,
+        cmap="RdYlGn",
+        vmin=-1, vmax=1,
+        center=0,
+        annot=annot,
+        fmt="",
+        linewidths=0.3,
+        linecolor="#ddd",
+        square=True,
+        cbar_kws={"label": "cosine similarity", "shrink": 0.7},
+    )
+    ax.set_title(
+        f"Inter-feature centroid similarity (top {len(feature_ids)} by specificity)",
+        fontsize=12, pad=12,
+    )
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=7)
+    ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=7)
+    plt.tight_layout()
+    plt.show()
+
+    # Print pairs above threshold for easy inspection
+    redundant_pairs = []
+    for i in range(len(feature_ids)):
+        for j in range(i + 1, len(feature_ids)):
+            if sim_matrix[i, j] >= annot_threshold:
+                redundant_pairs.append({
+                    "feature_a": feature_ids[i],
+                    "feature_b": feature_ids[j],
+                    "cosine_sim": round(float(sim_matrix[i, j]), 4),
+                })
+
+    if redundant_pairs:
+        print(f"\nPotentially redundant pairs (cosine_sim >= {annot_threshold}):")
+        display(pd.DataFrame(redundant_pairs).sort_values("cosine_sim", ascending=False))
+    else:
+        print(f"\nNo pairs with cosine_sim >= {annot_threshold} — features appear well-separated.")
+
+    return sim_matrix, feature_ids
