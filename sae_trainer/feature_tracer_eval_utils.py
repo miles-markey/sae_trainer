@@ -431,7 +431,7 @@ def plot_inter_feature_similarity(
 
     if redundant_pairs:
         print(f"\nPotentially redundant pairs (cosine_sim >= {annot_threshold}):")
-        display(pd.DataFrame(redundant_pairs).sort_values("cosine_sim", ascending=False))
+        ipy_display(pd.DataFrame(redundant_pairs).sort_values("cosine_sim", ascending=False))
     else:
         print(f"\nNo pairs with cosine_sim >= {annot_threshold} — features appear well-separated.")
 
