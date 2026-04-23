@@ -364,6 +364,7 @@ class FeatureTracer:
         model_name: str = "all-MiniLM-L6-v2",
         weighted: bool = True,
         mask_same_context: bool = True,
+        min_prompts: int = 5,   # minimum distinct prompts a feature must appear in to be scored
     ) -> pd.DataFrame:
         """
         Compute a specificity score for each feature as the mean pairwise cosine
@@ -408,16 +409,20 @@ class FeatureTracer:
             emb = data["embeddings"]
             acts = data["activations"]
             n = len(acts)
+
+            pids = np.array(data["prompt_ids"]) if "prompt_ids" in data else None
+            n_distinct_prompts = len(set(pids)) if pids is not None else n
+            if n_distinct_prompts < min_prompts:
+                continue
+
             weights = acts / (acts.sum() + 1e-8) if weighted else np.ones(n) / n
 
-            if mask_same_context and "prompt_ids" in data:
-                pids = np.array(data["prompt_ids"])
-                tpos = data["token_positions"]
-                w = self.cfg.context_window
-                # Mask out pairs from the same prompt whose windows overlap
+            if mask_same_context and pids is not None:
+                # Mask out all pairs from the same prompt — even distant token positions
+                # share document-level similarity (topic, style, vocabulary) that would
+                # inflate specificity scores independently of the feature's actual semantics
                 same_prompt = pids[:, None] == pids[None, :]
-                close_pos = np.abs(tpos[:, None] - tpos[None, :]) <= (2 * w)
-                valid_pairs_mask = ~(same_prompt & close_pos)
+                valid_pairs_mask = ~same_prompt
             else:
                 valid_pairs_mask = np.ones((n, n), dtype=bool)
 
@@ -425,6 +430,7 @@ class FeatureTracer:
             rows.append({
                 "feature_id": fid,
                 "hits": len(acts),
+                "n_prompts": n_distinct_prompts,
                 "mean_activation": float(acts.mean()),
                 "specificity": score,
             })
