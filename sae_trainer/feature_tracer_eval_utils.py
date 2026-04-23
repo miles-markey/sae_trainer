@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import html as html_lib
 from IPython.display import HTML, display as ipy_display
-# import umap
+import umap
 from .feature_tracer_utils import FeatureTracer
 
 def top_n_feats_by_hits_count(tracer: FeatureTracer, top_n=30):
@@ -203,17 +203,19 @@ def plot_feature_umap(
     tracer,
     top_n: int = 20,           # restrict to top-N features by specificity to keep plot readable
     random_state: int = 42,
-    figsize=(16, 7),
+    figsize=(10, 7),
 ):
     """
-    Two side-by-side UMAP plots:
+    Two separate UMAP figures (shown one after the other):
 
-    Left — Token-level: each point is one context window embedding, colored by feature_id.
-           Shows whether each feature's activating contexts cluster tightly.
+    1) Token-level: each point is one context window embedding, colored by feature_id.
+       Shows whether each feature's activating contexts cluster tightly.
 
-    Right — Centroid-level: each point is one feature (mean embedding).
-            Point size = hit count, color = specificity_vs_baseline (if scores provided).
-            Shows the broader feature landscape and how features relate to each other.
+    2) Centroid-level: each point is one feature (mean embedding).
+       Point size = hit count, color = specificity_vs_baseline (if scores provided).
+       Shows the broader feature landscape and how features relate to each other.
+
+    figsize applies to each figure independently.
     """
 
     # --- Usage ---
@@ -258,15 +260,16 @@ def plot_feature_umap(
     ])
 
     # Color palette — one color per feature
-    palette = cm.get_cmap("tab20", len(top_fids))
+    palette = plt.get_cmap("tab20", len(top_fids))
     color_map = {fid: palette(i) for i, fid in enumerate(top_fids)}
     colors = [color_map[fid] for fid in all_labels]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+    hit_counts = np.array([len(selected[fid]["activations"]) for fid in top_fids])
+    marker_sizes = 50 + 200 * (hit_counts / hit_counts.max())  # scale dot size by hits
 
-    # --- Left: token-level ---
+    # --- Figure 1: token-level ---
+    fig1, ax1 = plt.subplots(figsize=figsize)
     ax1.scatter(token_2d[:, 0], token_2d[:, 1], c=colors, s=8, alpha=0.6, linewidths=0)
-    # Label each cluster at its centroid
     for i, fid in enumerate(top_fids):
         ax1.annotate(
             str(fid), centroids_2d[i],
@@ -277,11 +280,12 @@ def plot_feature_umap(
     ax1.set_xlabel("UMAP-1")
     ax1.set_ylabel("UMAP-2")
     ax1.axis("off")
+    fig1.suptitle("Feature Embedding Landscape — token level", fontsize=13, y=1.02)
+    fig1.tight_layout()
+    plt.show()
 
-    # --- Right: centroid-level ---
-    hit_counts = np.array([len(selected[fid]["activations"]) for fid in top_fids])
-    marker_sizes = 50 + 200 * (hit_counts / hit_counts.max())  # scale dot size by hits
-
+    # --- Figure 2: centroid-level ---
+    fig2, ax2 = plt.subplots(figsize=figsize)
     if specificity_scores is not None and "specificity_vs_baseline" in specificity_scores.columns:
         score_map = specificity_scores.set_index("feature_id")["specificity_vs_baseline"]
         spec_values = np.array([score_map.get(fid, 0.0) for fid in top_fids])
@@ -290,7 +294,7 @@ def plot_feature_umap(
             s=marker_sizes, c=spec_values, cmap="RdYlGn",
             alpha=0.85, linewidths=0.5, edgecolors="grey",
         )
-        plt.colorbar(sc, ax=ax2, label="specificity_vs_baseline")
+        fig2.colorbar(sc, ax=ax2, label="specificity_vs_baseline")
     else:
         centroid_colors = [color_map[fid] for fid in top_fids]
         ax2.scatter(
@@ -306,9 +310,8 @@ def plot_feature_umap(
     ax2.set_xlabel("UMAP-1")
     ax2.set_ylabel("UMAP-2")
     ax2.axis("off")
-
-    plt.suptitle("Feature Embedding Landscape", fontsize=13, y=1.01)
-    plt.tight_layout()
+    fig2.suptitle("Feature Embedding Landscape — centroids", fontsize=13, y=1.02)
+    fig2.tight_layout()
     plt.show()
 
 def compute_inter_feature_similarity(feature_embeddings: dict) -> tuple[np.ndarray, list]:
