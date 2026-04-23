@@ -4,7 +4,14 @@ import pandas as pd
 import numpy as np
 import html as html_lib
 from IPython.display import HTML, display as ipy_display
-import umap
+
+# Optional: UMAP plots (install `umap-learn`, e.g. `uv sync --group full`)
+try:
+    import umap
+    HAS_UMAP = True
+except Exception:
+    HAS_UMAP = False
+
 from .feature_tracer_utils import FeatureTracer
 
 def top_n_feats_by_hits_count(tracer: FeatureTracer, top_n=30):
@@ -217,6 +224,12 @@ def plot_feature_umap(
 
     figsize applies to each figure independently.
     """
+    if not HAS_UMAP:
+        print(
+            "UMAP is not installed. Use the `full` dependency group (includes umap-learn), "
+            "e.g. `uv sync --group full`, or run `pip install umap-learn`."
+        )
+        return
 
     # --- Usage ---
     # scores = tracer.feature_specificity_scores(feature_embeddings=embeddings)

@@ -1,4 +1,7 @@
-# requirements.txt
+# Legacy pip install list. Prefer `pyproject.toml` + uv:
+#   uv sync                    # default: full group (includes umap-learn)
+#   uv sync --group subset     # no UMAP
+#   uv sync --no-default-groups --group subset
 pip==24.3.1
 setuptools==75.6.0
 wheel==0.45.1

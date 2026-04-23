@@ -1,0 +1,46 @@
+[project]
+name = "sae-trainer"
+version = "0.1.0"
+description = "Sparse autoencoder training utilities"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+# Install groups with: `uv sync --group subset` or `uv sync --group full`
+# (see [tool.uv.default-groups] for what bare `uv sync` installs.)
+dependencies = []
+
+[build-system]
+requires = ["hatchling>=1.23.0"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+# Mirrors requirements.txt (no build tooling; uv handles that). No UMAP.
+subset = [
+    "numpy==1.26.4",
+    "scipy==1.13.1",
+    "pandas==2.2.3",
+    "matplotlib==3.10.8",
+    "torch==2.2.2",
+    "transformers==4.46.3",
+    "tokenizers==0.20.3",
+    "accelerate==1.0.1",
+    "huggingface-hub==0.26.2",
+    "safetensors==0.4.5",
+    "sentencepiece==0.2.0",
+    "datasets==4.8.4",
+    "sentence-transformers==5.4.1",
+    "seaborn==0.13.2",
+    "jupyterlab==4.3.1",
+    "ipykernel==6.29.5",
+    "python-dotenv==1.0.1",
+]
+# subset + optional UMAP (feature / latent plots)
+full = [
+    { include-group = "subset" },
+    "umap-learn==0.5.7",
+]
+
+[tool.uv]
+default-groups = ["full"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["sae_trainer"]
