@@ -24,7 +24,7 @@ def make_collate_fn(tokenizer, max_length=256):
         )
     return collate
 
-def get_data_loaders(accum, layer_idx):
+def get_data_loaders(accum, layer_idx, batch_size=2048):
     # Example training input for SAE from one layer:
     x_train = accum["residual_out"][layer_idx]   # shape [N_tokens, 3584]
 
@@ -36,7 +36,6 @@ def get_data_loaders(accum, layer_idx):
     n_train = n_total - n_val
     train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(42))
 
-    batch_size = 2048
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 

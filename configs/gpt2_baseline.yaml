@@ -1,0 +1,19 @@
+# Model
+model_name: gpt2
+#d_in: 768 # inferred from model
+expansion_factor: 8
+normalize_decoder: true
+collection_batch_size: 8
+
+# Data
+dataset_name: wikitext
+
+# Training
+epochs: 5
+sae_batch_size: 2048
+lr: 3.0e-4
+weight_decay: 1.0e-4
+lambda_l1: 1.0e-2
+lambda_kl: 1.0e-3
+target_firing_rate: 0.02
+mass_frac_threshold: 0.001

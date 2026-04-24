@@ -32,6 +32,7 @@ subset = [
     "jupyterlab==4.3.1",
     "ipykernel==6.29.5",
     "python-dotenv==1.0.1",
+    "pyyaml>=6.0",
 ]
 # subset + optional UMAP (feature / latent plots)
 full = [
