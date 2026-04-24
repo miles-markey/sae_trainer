@@ -9,15 +9,15 @@ collection_batch_size: 8
 dataset_name: wikitext
 
 # Logging
-use_wandb: false
+use_wandb: true
 wandb_project: sae-trainer
 
 # Training
-num_epochs: 5
+num_epochs: 20
 sae_batch_size: 2048
 lr: 3.0e-4
 weight_decay: 1.0e-4
 lambda_l1: 1.0e-2
 lambda_kl: 1.0e-3
 target_firing_rate: 0.02
-mass_frac_threshold: 0.001
+mass_frac_threshold: 0.002

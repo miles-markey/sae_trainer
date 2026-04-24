@@ -6,3 +6,7 @@
 .DS_Store
 **/__pycache__/
 **/scratch_work.py
+wandb/
+configs/
+!configs/gpt2_baseline.yaml
+!configs/qwen05_baseline.yaml
