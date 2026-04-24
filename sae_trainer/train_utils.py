@@ -77,9 +77,10 @@ def train_sae(
     mass_frac_threshold=0.01,
     lambda_kl: float = 0.0,
     target_firing_rate: float = 0.01,
+    num_epochs=20,
+    run=None,
 ):
 
-    epochs = 20
     history = {
         "train_loss": [],
         "train_recon": [],
@@ -92,7 +93,7 @@ def train_sae(
         "val_active": [],
     }
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(1, num_epochs + 1):
         sae.train()
         running_loss, running_recon, running_l1, running_kl, seen = 0.0, 0.0, 0.0, 0.0, 0
 
@@ -149,6 +150,20 @@ def train_sae(
         history["val_l1"].append(val_metrics["l1"])
         history["val_kl"].append(val_metrics["kl"])
         history["val_active"].append(val_metrics["active"])
+
+        if run:
+            run.log({
+                "train/loss": train_metrics["loss"],
+                "train/recon": train_metrics["recon"],
+                "train/l1": train_metrics["l1"],
+                "train/kl": train_metrics["kl"],
+                "val/loss": val_metrics["loss"],
+                "val/recon": val_metrics["recon"],
+                "val/l1": val_metrics["l1"],
+                "val/kl": val_metrics["kl"],
+                "val/active_features": val_metrics["active"],
+                "epoch": epoch,
+            })
 
         kl_str = (
             f", kl {train_metrics['kl']:.6f} / {val_metrics['kl']:.6f}"

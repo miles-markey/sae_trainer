@@ -13,6 +13,8 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from datasets import load_dataset
 
+import wandb
+
 from .dataset_utils import make_collate_fn, TextDataset, get_data_loaders
 from .train_utils import train_sae
 from .eval_utils import evaluate_sae, visualize_sae
@@ -24,7 +26,16 @@ def load_config(path: str) -> SimpleNamespace:
         data = yaml.safe_load(f)
     return SimpleNamespace(**data)
 
-def training_wrapper(cfg, accum, layer_idx, device, mass_frac_threshold, save_mode=False):
+def training_wrapper(cfg, accum, layer_idx, device, mass_frac_threshold, save_mode=False, show_curves=False):
+
+    run = None
+    if cfg.use_wandb:
+        run = wandb.init(
+            project=cfg.wandb_project,
+            name=f"{cfg.model_name}_layer{layer_idx}",
+            config=vars(cfg),
+            reinit=True,
+        )
 
     train_loader, val_loader, d_in = get_data_loaders(accum, layer_idx, cfg.sae_batch_size)
     # ---- Model + optimizer ----
@@ -41,18 +52,23 @@ def training_wrapper(cfg, accum, layer_idx, device, mass_frac_threshold, save_mo
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=20)
 
     sae, history = train_sae(
-        sae, 
-        train_loader, 
-        val_loader, 
-        opt, 
-        scheduler, 
-        device, 
+        sae,
+        train_loader,
+        val_loader,
+        opt,
+        scheduler,
+        device,
         lambda_l1=lambda_l1,
-        show_curves=False,
+        show_curves=show_curves,
         mass_frac_threshold=mass_frac_threshold,
-        lambda_kl=cfg.lambda_kl,           # tune in log space, e.g. 1e-4 … 1e-2
-        target_firing_rate=cfg.target_firing_rate,  # desired ~soft firing mass per latent
+        lambda_kl=cfg.lambda_kl,
+        target_firing_rate=cfg.target_firing_rate,
+        num_epochs=cfg.num_epochs,
+        run=run,
         )
+
+    if run:
+        run.finish()
 
     if save_mode:
         save_filename = f"sae_{cfg.model_name}_layer{layer_idx}.pt"
@@ -181,7 +197,7 @@ if __name__ == '__main__':
     device = "cuda" if torch.cuda.is_available() else "cpu"
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
-    parser.add_argument("--save-saes", type=bool, default=False)
+    parser.add_argument("--save-saes", action="store_true", default=False)
     args = parser.parse_args()
     cfg = load_config(args.config)
     train(cfg, args, device)
