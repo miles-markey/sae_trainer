@@ -26,7 +26,7 @@ def load_config(path: str) -> SimpleNamespace:
         data = yaml.safe_load(f)
     return SimpleNamespace(**data)
 
-def training_wrapper(cfg, accum, layer_idx, device, mass_frac_threshold, save_mode=False, show_curves=False):
+def training_wrapper(cfg, accum, layer_idx, device, save_mode=False, show_curves=False):
 
     run = None
     if cfg.use_wandb:
@@ -49,7 +49,7 @@ def training_wrapper(cfg, accum, layer_idx, device, mass_frac_threshold, save_mo
     lambda_l1 = cfg.lambda_l1
 
     # Optional: LR scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=20)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.num_epochs)
 
     sae, history = train_sae(
         sae,
@@ -60,7 +60,7 @@ def training_wrapper(cfg, accum, layer_idx, device, mass_frac_threshold, save_mo
         device,
         lambda_l1=lambda_l1,
         show_curves=show_curves,
-        mass_frac_threshold=mass_frac_threshold,
+        mass_frac_threshold=cfg.mass_frac_threshold,
         lambda_kl=cfg.lambda_kl,
         target_firing_rate=cfg.target_firing_rate,
         num_epochs=cfg.num_epochs,
@@ -113,8 +113,14 @@ def get_dataloader(cfg, tokenizer):
     else:
         raise ValueError(f"Invalid dataset name: {cfg.dataset_name}. Expected 'openwebtext' or 'wikitext'.")
 
+    # set max_texts to 1.2*(cfg.max_batches*collection_batch_size) to give us a little headroom
+    max_texts = 1.2 * cfg.max_batches * cfg.collection_batch_size
+
     for row in ds:
-        texts.append(row["text"])
+        if len(texts) >= max_texts:
+            break
+        if row["text"].strip():
+            texts.append(row["text"])
     dataset = TextDataset(texts)
 
     loader = DataLoader(
@@ -176,10 +182,8 @@ def train(cfg, args, device):
     target_layers = collector.get_layers()
     collector.register()
 
-    accum = collect_activations(loader, collector, target_layers, device, max_batches=50)
+    accum = collect_activations(loader, collector, target_layers, device, max_batches=cfg.max_batches)
     
-    mass_frac_threshold=cfg.mass_frac_threshold
-
     saes = {}
     histories = {}
     train_loaders = {}
@@ -187,7 +191,7 @@ def train(cfg, args, device):
 
     for target_layer in target_layers:
         print(f"Training SAE for layer {target_layer}")
-        sae, history, train_loader, val_loader = training_wrapper(cfg, accum, target_layer, device, mass_frac_threshold, save_mode=save_mode)
+        sae, history, train_loader, val_loader = training_wrapper(cfg, accum, target_layer, device, save_mode=save_mode)
         saes[target_layer] = sae
         histories[target_layer] = history
         train_loaders[target_layer] = train_loader

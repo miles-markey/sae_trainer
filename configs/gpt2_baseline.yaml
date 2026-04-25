@@ -1,12 +1,12 @@
 # Model
 model_name: gpt2
-#d_in: 768 # inferred from model
 expansion_factor: 8
 normalize_decoder: true
 collection_batch_size: 8
 
 # Data
 dataset_name: wikitext
+max_batches: 50
 
 # Logging
 use_wandb: true
