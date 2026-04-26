@@ -25,10 +25,12 @@ def make_collate_fn(tokenizer, max_length=256):
     return collate
 
 def get_data_loaders(accum, layer_idx, batch_size=2048):
-    # Example training input for SAE from one layer:
-    x_train = accum["residual_out"][layer_idx]   # shape [N_tokens, 3584]
+    x = accum["residual_out"][layer_idx].float().cpu()
 
-    x = x_train.float().cpu()  # keep dataset on CPU; move mini-batches to device
+    # Normalize by mean L2 norm so reconstruction and sparsity losses are balanced in scale.
+    # Scale factor is returned so callers can store it in checkpoints for denormalization at inference.
+    scale = x.norm(dim=-1).mean().clamp(min=1e-8)
+    x = x / scale
 
     dataset = TensorDataset(x)
     n_total = len(dataset)
@@ -39,4 +41,4 @@ def get_data_loaders(accum, layer_idx, batch_size=2048):
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
-    return train_loader, val_loader, x.shape[1]
+    return train_loader, val_loader, x.shape[1], scale

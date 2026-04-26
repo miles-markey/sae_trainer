@@ -32,12 +32,12 @@ def training_wrapper(cfg, accum, layer_idx, device, save_mode=False, show_curves
     if cfg.use_wandb:
         run = wandb.init(
             project=cfg.wandb_project,
-            name=f"{cfg.model_name}_layer{layer_idx}",
+            name=f"{cfg.model_name}_{cfg.dataset_name}_layer{layer_idx}",
             config=vars(cfg),
             reinit=True,
         )
 
-    train_loader, val_loader, d_in = get_data_loaders(accum, layer_idx, cfg.sae_batch_size)
+    train_loader, val_loader, d_in, act_scale = get_data_loaders(accum, layer_idx, cfg.sae_batch_size)
     # ---- Model + optimizer ----
     expansion = cfg.expansion_factor               # 4-16 are common starting points
     d_latent = d_in * expansion # d_in = 3584, so this should be in ~[14k, 60k] (14336-57344)
@@ -71,13 +71,14 @@ def training_wrapper(cfg, accum, layer_idx, device, save_mode=False, show_curves
         run.finish()
 
     if save_mode:
-        save_filename = f"sae_{cfg.model_name}_layer{layer_idx}.pt"
+        save_filename = f"sae_{cfg.model_name}_{cfg.dataset_name}_layer{layer_idx}.pt"
         # ---- Save checkpoint ----
         ckpt = {
             "model_state": sae.state_dict(),
             "d_in": d_in,
             "d_latent": d_latent,
             "lambda_l1": lambda_l1,
+            "act_scale": act_scale.item(),
             "history": history,
         }
         torch.save(ckpt, save_filename)
