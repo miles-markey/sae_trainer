@@ -19,7 +19,8 @@ def evaluate(
     target_firing_rate: float = 0.01,
 ):
     model.eval()
-    total_loss, total_recon, total_l1, total_kl, total_active, n = (
+    total_loss, total_recon, total_l1, total_kl, total_active, total_nonzero, n = (
+        0.0,
         0.0,
         0.0,
         0.0,
@@ -46,7 +47,7 @@ def evaluate(
             row_sum = az.sum(dim=1, keepdim=True).clamp(min=1e-8)
             frac = az / row_sum
             active = (frac > mass_frac_threshold).float().sum(dim=1).mean()
-            #active = (z > 1e-6).float().sum(dim=1).mean()  # avg active features per token
+            nonzero = (z > 0).float().sum(dim=-1).mean()
 
             bs = xb.size(0)
             total_loss += loss.item() * bs
@@ -54,6 +55,7 @@ def evaluate(
             total_l1 += l1.item() * bs
             total_kl += kl.item() * bs
             total_active += active.item() * bs
+            total_nonzero += nonzero.item() * bs
             n += bs
 
     out = {
@@ -61,6 +63,7 @@ def evaluate(
         "recon": total_recon / n,
         "l1": total_l1 / n,
         "active": total_active / n,
+        "nonzero": total_nonzero / n,
     }
     out["kl"] = total_kl / n if lambda_kl > 0 else 0.0
     return out
@@ -91,6 +94,7 @@ def train_sae(
         "val_l1": [],
         "val_kl": [],
         "val_active": [],
+        "val_nonzero": [],
     }
 
     for epoch in range(1, num_epochs + 1):
@@ -150,6 +154,7 @@ def train_sae(
         history["val_l1"].append(val_metrics["l1"])
         history["val_kl"].append(val_metrics["kl"])
         history["val_active"].append(val_metrics["active"])
+        history["val_nonzero"].append(val_metrics["nonzero"])
 
         if run:
             run.log({
@@ -162,6 +167,7 @@ def train_sae(
                 "val/l1": val_metrics["l1"],
                 "val/kl": val_metrics["kl"],
                 "val/active_features": val_metrics["active"],
+                "val/nonzero_features": val_metrics["nonzero"],
                 "epoch": epoch,
             })
 
