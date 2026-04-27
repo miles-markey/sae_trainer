@@ -133,7 +133,11 @@ def render_feature_card(
         scope_label = f" | pos={token_pos}"
 
     # Reconstruct token-split contexts for precise highlighting
-    top_rows = sub.sort_values("activation", ascending=False).head(top_n)
+    top_rows = (
+        sub.sort_values("activation", ascending=False)
+        .drop_duplicates(subset="prompt_id", keep="first")
+        .head(top_n)
+    )
     contexts = []
     for _, r in top_rows.iterrows():
         ids = tracer.tokenizer(r["generated_text"], return_tensors="pt")["input_ids"][0]
