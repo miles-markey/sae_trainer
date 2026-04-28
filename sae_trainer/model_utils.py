@@ -52,3 +52,33 @@ class SparseAutoencoder(nn.Module):
         if return_pre_relu:
             return x_hat, z, h
         return x_hat, z
+
+
+# ---- Top-K SAE ----
+class TopKSparseAutoencoder(nn.Module):
+    def __init__(self, d_in: int, d_latent: int, k: int, normalize_decoder: bool = True):
+        super().__init__()
+        self.k = k
+        self.normalize_decoder = normalize_decoder
+        self.encoder = nn.Linear(d_in, d_latent, bias=True)
+        self.decoder = nn.Linear(d_latent, d_in, bias=False)
+
+        nn.init.xavier_uniform_(self.encoder.weight)
+        nn.init.xavier_uniform_(self.decoder.weight)
+
+    def forward(self, x, return_pre_relu: bool = False):
+        h = self.encoder(x)
+        # Keep only the top-k activations per token, zero the rest
+        topk_vals, topk_idx = torch.topk(h, self.k, dim=-1)
+        topk_vals = F.relu(topk_vals)  # ensure non-negative
+        z = torch.zeros_like(h).scatter_(-1, topk_idx, topk_vals)
+
+        if self.normalize_decoder:
+            W = self.decoder.weight
+            scale = W.norm(dim=0, keepdim=True).clamp(min=1e-8)
+            W = W / scale
+            x_hat = F.linear(z, W, self.decoder.bias)
+        else:
+            x_hat = self.decoder(z)
+
+        return x_hat, z

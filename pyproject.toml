@@ -39,6 +39,7 @@ subset = [
 full = [
     { include-group = "subset" },
     "umap-learn==0.5.7",
+    "scikit-learn<1.6",
 ]
 
 [tool.uv]

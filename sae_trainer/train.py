@@ -18,7 +18,7 @@ import wandb
 from .dataset_utils import make_collate_fn, TextDataset, get_data_loaders
 from .train_utils import train_sae
 from .eval_utils import evaluate_sae, visualize_sae
-from .model_utils import SparseAutoencoder
+from .model_utils import SparseAutoencoder, TopKSparseAutoencoder
 from .activation_collector_utils import GPT2ActivationCollector, QwenActivationCollector
 
 def load_config(path: str) -> SimpleNamespace:
@@ -38,11 +38,16 @@ def training_wrapper(cfg, accum, layer_idx, device, save_mode=False, show_curves
         )
 
     train_loader, val_loader, d_in, act_scale = get_data_loaders(accum, layer_idx, cfg.sae_batch_size)
+    if run:
+        run.summary["act_scale"] = act_scale.item()
     # ---- Model + optimizer ----
     expansion = cfg.expansion_factor               # 4-16 are common starting points
     d_latent = d_in * expansion # d_in = 3584, so this should be in ~[14k, 60k] (14336-57344)
 
-    sae = SparseAutoencoder(d_in=d_in, d_latent=d_latent, normalize_decoder=cfg.normalize_decoder).to(device)
+    if cfg.sae_type == "topk":
+        sae = TopKSparseAutoencoder(d_in=d_in, d_latent=d_latent, k=cfg.k, normalize_decoder=cfg.normalize_decoder).to(device)
+    else:
+        sae = SparseAutoencoder(d_in=d_in, d_latent=d_latent, normalize_decoder=cfg.normalize_decoder).to(device)
     opt = torch.optim.AdamW(sae.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     # Sparsity strength: tune this. Start small.
@@ -50,6 +55,7 @@ def training_wrapper(cfg, accum, layer_idx, device, save_mode=False, show_curves
 
     # Optional: LR scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.num_epochs)
+    #scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=5)
 
     sae, history = train_sae(
         sae,
@@ -64,6 +70,8 @@ def training_wrapper(cfg, accum, layer_idx, device, save_mode=False, show_curves
         lambda_kl=cfg.lambda_kl,
         target_firing_rate=cfg.target_firing_rate,
         num_epochs=cfg.num_epochs,
+        lambda_l1_warmup_epochs=cfg.lambda_l1_warmup_epochs,
+        resample_interval_epochs=cfg.resample_interval_epochs,
         run=run,
         )
 
