@@ -32,7 +32,7 @@ def training_wrapper(cfg, accum, layer_idx, device, save_mode=False, show_curves
     if cfg.use_wandb:
         run = wandb.init(
             project=cfg.wandb_project,
-            name=f"{cfg.model_name}_{cfg.dataset_name}_layer{layer_idx}",
+            name=f"{cfg.sae_type}_{cfg.model_name}_{cfg.dataset_name}_layer{layer_idx}",
             config=vars(cfg),
             reinit=True,
         )
@@ -175,7 +175,7 @@ def train(cfg, args, device):
 
     loader = get_dataloader(cfg, tokenizer)
 
-    collector = collector_class(model=model)
+    collector = collector_class(model=model, layer_ids=cfg.target_layer_idxs)
     target_layers = collector.get_layers()
     collector.register()
 

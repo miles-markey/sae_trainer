@@ -1,97 +1,72 @@
 from abc import ABC, abstractmethod
 import torch
-from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from typing import List, Dict, Optional
-import torch.nn as nn
 import torch.nn.functional as F
-from .model_utils import SparseAutoencoder, ReluSparseAutoencoder, TopKSparseAutoencoder
-from .train_utils import resample_dead_features, firing_rate_kl_loss
 import matplotlib.pyplot as plt
+
+from .model_utils import ReluSparseAutoencoder, TopKSparseAutoencoder
+from .train_utils import resample_dead_features, firing_rate_kl_loss
 
 class SAETrainingModule(ABC):
     def __init__(self, resample_dead_neurons: bool):
         super().__init__()
         self.resample_dead_neurons = resample_dead_neurons
-    
+
     @abstractmethod
-    def train_sae(self, train_dataloader, val_dataloader, opt, scheduler, device, cfg, run=None):
-        ...
-    
-    @abstractmethod
-    def evaluate_sae(self, dataloader, device, cfg):
+    def _train_step(self, xb: torch.Tensor, cfg, effective_lambda_l1: float):
+        # Returns (loss_tensor, z_tensor, metrics_dict)
+        # metrics_dict keys: loss, recon, l1, kl  (all floats, not tensors)
         ...
 
-class ReluSAETrainingModule(SAETrainingModule):
-    '''
-    Relu-SAE
-    resample_dead_neurons = False by default since dead neuron resampling is not very impactful for Relu-SAEs
-    This can be overriden if desired
-    '''
-    def __init__(self, d_in: int, d_latent: int, device, normalize_decoder: bool = True, resample_dead_neurons: bool = False):
-        super().__init__(resample_dead_neurons=resample_dead_neurons)
-        self.sae = ReluSparseAutoencoder(d_in=d_in, d_latent=d_latent, normalize_decoder=normalize_decoder).to(device)
+    @abstractmethod
+    def _eval_step(self, xb: torch.Tensor, cfg):
+        # Returns (x_hat_tensor, z_tensor, metrics_dict)
+        # metrics_dict keys: loss, recon, l1, kl  (all floats, not tensors)
+        ...
 
     def train_sae(self, train_loader, val_loader, opt, scheduler, device, cfg, run=None, show_curves=False):
-        history = {
-            "train_loss": [],
-            "train_recon": [],
-            "train_l1": [],
-            "train_kl": [],
-            "val_loss": [],
-            "val_recon": [],
-            "val_l1": [],
-            "val_kl": [],
-            "val_active": [],
-            "val_nonzero": [],
-            "val_fve": [],
-            "val_dead_frac": [],
-        }
+        history = {k: [] for k in [
+            "train_loss", "train_recon", "train_l1", "train_kl",
+            "val_loss", "val_recon", "val_l1", "val_kl",
+            "val_active", "val_nonzero", "val_fve", "val_dead_frac",
+        ]}
 
         d_latent = self.sae.encoder.weight.shape[0]
         fired_this_interval = torch.zeros(d_latent, dtype=torch.bool, device=device)
+        resample_interval = getattr(cfg, "resample_interval_epochs", 0)
 
         for epoch in range(1, cfg.num_epochs + 1):
             self.sae.train()
-            running_loss, running_recon, running_l1, running_kl, seen = 0.0, 0.0, 0.0, 0.0, 0
+            running = {"loss": 0.0, "recon": 0.0, "l1": 0.0, "kl": 0.0}
+            seen = 0
 
-            if cfg.lambda_l1_warmup_epochs > 0:
-                effective_lambda_l1 = cfg.lambda_l1 * min(1.0, epoch / cfg.lambda_l1_warmup_epochs)
-            else:
-                effective_lambda_l1 = cfg.lambda_l1
+            lambda_l1 = getattr(cfg, "lambda_l1", 0.0)
+            lambda_l1_warmup = getattr(cfg, "lambda_l1_warmup_epochs", 0)
+            effective_lambda_l1 = (
+                lambda_l1 * min(1.0, epoch / lambda_l1_warmup)
+                if lambda_l1_warmup > 0
+                else lambda_l1
+            )
 
             for (xb,) in train_loader:
                 xb = xb.to(device, non_blocking=True)
-
-                if cfg.lambda_kl > 0:
-                    x_hat, z, h = self.sae(xb, return_pre_relu=True)
-                    kl = firing_rate_kl_loss(h, cfg.target_firing_rate)
-                else:
-                    x_hat, z = self.sae(xb)
-                    kl = torch.zeros((), device=device)
-
-                recon = F.mse_loss(x_hat, xb)
-                l1 = z.abs().mean()
-                loss = recon + effective_lambda_l1 * l1 + cfg.lambda_kl * kl
+                loss, z, batch_metrics = self._train_step(xb, cfg, effective_lambda_l1)
 
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.sae.parameters(), 1.0)
                 opt.step()
 
-                if self.resample_dead_neurons:
+                if self.resample_dead_neurons and resample_interval > 0:
                     fired_this_interval |= (z.detach() > 0).any(dim=0)
 
                 bs = xb.size(0)
-                running_loss += loss.item() * bs
-                running_recon += recon.item() * bs
-                running_l1 += l1.item() * bs
-                running_kl += kl.item() * bs
+                for k in running:
+                    running[k] += batch_metrics[k] * bs
                 seen += bs
 
             scheduler.step()
 
-            if self.resample_dead_neurons and epoch % cfg.resample_interval_epochs == 0:
+            if self.resample_dead_neurons and resample_interval > 0 and epoch % resample_interval == 0:
                 dead_mask = ~fired_this_interval
                 n_resampled = resample_dead_features(self.sae, train_loader, opt, device, dead_mask)
                 print(f"  [resample] epoch {epoch}: resampled {n_resampled} dead features")
@@ -99,30 +74,13 @@ class ReluSAETrainingModule(SAETrainingModule):
                     run.log({"resample/n_resampled": n_resampled, "epoch": epoch})
                 fired_this_interval.zero_()
 
-            train_metrics = {
-                "loss": running_loss / seen,
-                "recon": running_recon / seen,
-                "l1": running_l1 / seen,
-                "kl": running_kl / seen,
-            }
-            val_metrics = self.evaluate_sae(
-                val_loader,
-                device,
-                cfg,
-            )
+            train_metrics = {k: v / seen for k, v in running.items()}
+            val_metrics = self.evaluate_sae(val_loader, device, cfg)
 
-            history["train_loss"].append(train_metrics["loss"])
-            history["train_recon"].append(train_metrics["recon"])
-            history["train_l1"].append(train_metrics["l1"])
-            history["train_kl"].append(train_metrics["kl"])
-            history["val_loss"].append(val_metrics["loss"])
-            history["val_recon"].append(val_metrics["recon"])
-            history["val_l1"].append(val_metrics["l1"])
-            history["val_kl"].append(val_metrics["kl"])
-            history["val_active"].append(val_metrics["active"])
-            history["val_nonzero"].append(val_metrics["nonzero"])
-            history["val_fve"].append(val_metrics["fve"])
-            history["val_dead_frac"].append(val_metrics["dead_frac"])
+            for k in ["loss", "recon", "l1", "kl"]:
+                history[f"train_{k}"].append(train_metrics[k])
+            for k in ["loss", "recon", "l1", "kl", "active", "nonzero", "fve", "dead_frac"]:
+                history[f"val_{k}"].append(val_metrics[k])
 
             if run:
                 run.log({
@@ -144,264 +102,128 @@ class ReluSAETrainingModule(SAETrainingModule):
 
             kl_str = (
                 f", kl {train_metrics['kl']:.6f} / {val_metrics['kl']:.6f}"
-                if cfg.lambda_kl > 0
+                if train_metrics["kl"] > 0
                 else ""
             )
             print(
                 f"Epoch {epoch:02d} | "
-                f"train loss {train_metrics['loss']:.6f} (recon {train_metrics['recon']:.6f}, l1 {train_metrics['l1']:.6f}{kl_str}) | "
-                f"val loss {val_metrics['loss']:.6f} (recon {val_metrics['recon']:.6f}, l1 {val_metrics['l1']:.6f}) | "
+                f"train loss {train_metrics['loss']:.6f} "
+                f"(recon {train_metrics['recon']:.6f}, l1 {train_metrics['l1']:.6f}{kl_str}) | "
+                f"val loss {val_metrics['loss']:.6f} "
+                f"(recon {val_metrics['recon']:.6f}, l1 {val_metrics['l1']:.6f}) | "
                 f"fve {val_metrics['fve']:.3f} | dead {val_metrics['dead_frac']:.2%}"
             )
 
-        # ---- Curves ----
         if show_curves:
-            plt.figure(figsize=(12,4))
-            plt.subplot(1,3,1)
+            plt.figure(figsize=(12, 4))
+            plt.subplot(1, 3, 1)
             plt.plot(history["train_recon"], label="train")
             plt.plot(history["val_recon"], label="val")
             plt.title("Reconstruction MSE")
             plt.legend()
-
-            plt.subplot(1,3,2)
+            plt.subplot(1, 3, 2)
             plt.plot(history["train_l1"], label="train")
             plt.plot(history["val_l1"], label="val")
             plt.title("Latent L1")
             plt.legend()
-
-            plt.subplot(1,3,3)
+            plt.subplot(1, 3, 3)
             plt.plot(history["val_active"])
             plt.title("Val active features/token")
-
             plt.tight_layout()
             plt.show()
-    
+
         return self.sae, history
-    
-    def evaluate_sae(self, loader, device, cfg):
+
+    def evaluate_sae(self, loader, device, cfg) -> dict:
         self.sae.eval()
-        total_loss, total_recon, total_l1, total_kl, total_active, total_nonzero, n = (
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0,
-        )
-        # FVE accumulators — kept as tensors to avoid d_in-sized Python loops
-        x_sum = None
-        x_sq_sum = None
+        totals = {"loss": 0.0, "recon": 0.0, "l1": 0.0, "kl": 0.0, "active": 0.0, "nonzero": 0.0}
+        x_sum = x_sq_sum = None
         total_ss_res = 0.0
-        ever_active = None  # [d_latent] bool, tracks which features fired at least once
+        ever_active = None
+        n = 0
 
         with torch.no_grad():
             for (xb,) in loader:
                 xb = xb.to(device, non_blocking=True)
-                if cfg.lambda_kl > 0:
-                    x_hat, z, h = self.sae(xb, return_pre_relu=True)
-                    kl = firing_rate_kl_loss(h, cfg.target_firing_rate)
-                else:
-                    x_hat, z = self.sae(xb)
-                    kl = torch.zeros((), device=device)
-
-                recon = F.mse_loss(x_hat, xb)
-                l1 = z.abs().mean()
-                loss = recon + cfg.lambda_l1 * l1 + cfg.lambda_kl * kl
+                x_hat, z, step_metrics = self._eval_step(xb, cfg)
 
                 az = z.abs()
-                row_sum = az.sum(dim=1, keepdim=True).clamp(min=1e-8)
-                frac = az / row_sum
+                frac = az / az.sum(dim=1, keepdim=True).clamp(min=1e-8)
                 active = (frac > cfg.mass_frac_threshold).float().sum(dim=1).mean()
                 nonzero = (z > 0).float().sum(dim=-1).mean()
 
-                # FVE: accumulate per-dimension sums for SS_tot, and SS_res
                 total_ss_res += ((x_hat - xb) ** 2).sum().item()
-                if x_sum is None:
-                    x_sum = xb.sum(dim=0)
-                    x_sq_sum = (xb ** 2).sum(dim=0)
-                else:
-                    x_sum += xb.sum(dim=0)
-                    x_sq_sum += (xb ** 2).sum(dim=0)
+                x_sum = xb.sum(dim=0) if x_sum is None else x_sum + xb.sum(dim=0)
+                x_sq_sum = (xb ** 2).sum(dim=0) if x_sq_sum is None else x_sq_sum + (xb ** 2).sum(dim=0)
 
-                # Dead features: union of active features across all batches
                 fired = (z > 0).any(dim=0)
                 ever_active = fired if ever_active is None else (ever_active | fired)
 
                 bs = xb.size(0)
-                total_loss += loss.item() * bs
-                total_recon += recon.item() * bs
-                total_l1 += l1.item() * bs
-                total_kl += kl.item() * bs
-                total_active += active.item() * bs
-                total_nonzero += nonzero.item() * bs
+                for k in ["loss", "recon", "l1", "kl"]:
+                    totals[k] += step_metrics[k] * bs
+                totals["active"] += active.item() * bs
+                totals["nonzero"] += nonzero.item() * bs
                 n += bs
 
-        # FVE = 1 - SS_res / SS_tot, where SS_tot = sum(x^2) - n*mean(x)^2
         mean_x = x_sum / n
         ss_tot = (x_sq_sum - n * mean_x ** 2).sum().item()
-        fve = 1.0 - total_ss_res / max(ss_tot, 1e-8)
-
-        dead_frac = (~ever_active).float().mean().item()
-
-        out = {
-            "loss": total_loss / n,
-            "recon": total_recon / n,
-            "l1": total_l1 / n,
-            "active": total_active / n,
-            "nonzero": total_nonzero / n,
-            "fve": fve,
-            "dead_frac": dead_frac,
+        return {
+            **{k: v / n for k, v in totals.items()},
+            "fve": 1.0 - total_ss_res / max(ss_tot, 1e-8),
+            "dead_frac": (~ever_active).float().mean().item(),
         }
-        out["kl"] = total_kl / n if cfg.lambda_kl > 0 else 0.0
-        return out
-    
+
+
+class ReluSAETrainingModule(SAETrainingModule):
+    """
+    ReLU-SAE. Supports L1, KL-divergence sparsity losses, and optional L1 warmup.
+    resample_dead_neurons defaults to False since resampling is less impactful for ReLU-SAEs.
+    """
+    def __init__(self, d_in: int, d_latent: int, device, normalize_decoder: bool = True, resample_dead_neurons: bool = False):
+        super().__init__(resample_dead_neurons=resample_dead_neurons)
+        self.sae = ReluSparseAutoencoder(d_in=d_in, d_latent=d_latent, normalize_decoder=normalize_decoder).to(device)
+
+    def _train_step(self, xb, cfg, effective_lambda_l1):
+        if cfg.lambda_kl > 0:
+            x_hat, z, h = self.sae(xb, return_pre_relu=True)
+            kl = firing_rate_kl_loss(h, cfg.target_firing_rate)
+        else:
+            x_hat, z = self.sae(xb)
+            kl = torch.zeros((), device=xb.device)
+        recon = F.mse_loss(x_hat, xb)
+        l1 = z.abs().mean()
+        loss = recon + effective_lambda_l1 * l1 + cfg.lambda_kl * kl
+        return loss, z, {"loss": loss.item(), "recon": recon.item(), "l1": l1.item(), "kl": kl.item()}
+
+    def _eval_step(self, xb, cfg):
+        if cfg.lambda_kl > 0:
+            x_hat, z, h = self.sae(xb, return_pre_relu=True)
+            kl = firing_rate_kl_loss(h, cfg.target_firing_rate)
+        else:
+            x_hat, z = self.sae(xb)
+            kl = torch.zeros((), device=xb.device)
+        recon = F.mse_loss(x_hat, xb)
+        l1 = z.abs().mean()
+        loss = recon + cfg.lambda_l1 * l1 + cfg.lambda_kl * kl
+        return x_hat, z, {"loss": loss.item(), "recon": recon.item(), "l1": l1.item(), "kl": kl.item()}
+
+
 class TopKSAETrainingModule(SAETrainingModule):
-    def __init__(self, d_in: int, d_latent: int, k: int, device, normalize_decoder: bool = True, resample_dead_neurons: bool = False):
+    """
+    TopK-SAE. Sparsity is enforced structurally (hard top-k); no L1/KL losses.
+    resample_dead_neurons defaults to True since dead features are a common problem with TopK-SAEs.
+    """
+    def __init__(self, d_in: int, d_latent: int, k: int, device, normalize_decoder: bool = True, resample_dead_neurons: bool = True):
         super().__init__(resample_dead_neurons=resample_dead_neurons)
         self.sae = TopKSparseAutoencoder(d_in=d_in, d_latent=d_latent, k=k, normalize_decoder=normalize_decoder).to(device)
-    
-    def train_sae(self, train_loader, val_loader, opt, scheduler, device, cfg, run=None, show_curves=False):
-        history = {
-            "train_loss": [],
-            "val_loss": [],
-            "val_active": [],
-            "val_nonzero": [],
-            "val_fve": [],
-            "val_dead_frac": [],
-        }
 
-        d_latent = self.sae.encoder.weight.shape[0]
-        fired_this_interval = torch.zeros(d_latent, dtype=torch.bool, device=device)
+    def _train_step(self, xb, _cfg, _effective_lambda_l1):
+        x_hat, z = self.sae(xb)
+        loss = F.mse_loss(x_hat, xb)
+        return loss, z, {"loss": loss.item(), "recon": loss.item(), "l1": 0.0, "kl": 0.0}
 
-        for epoch in range(1, cfg.num_epochs + 1):
-            self.sae.train()
-            running_loss, seen = 0.0, 0
-
-            for (xb,) in train_loader:
-                xb = xb.to(device, non_blocking=True)
-
-                x_hat, z = self.sae(xb)
-                kl = torch.zeros((), device=device)
-
-                loss = F.mse_loss(x_hat, xb)
-
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.sae.parameters(), 1.0)
-                opt.step()
-
-                if cfg.resample_interval_epochs > 0:
-                    fired_this_interval |= (z.detach() > 0).any(dim=0)
-
-                bs = xb.size(0)
-                running_loss += loss.item() * bs
-                seen += bs
-
-            scheduler.step()
-
-            if cfg.resample_interval_epochs > 0 and epoch % cfg.resample_interval_epochs == 0:
-                dead_mask = ~fired_this_interval
-                n_resampled = resample_dead_features(self.sae, train_loader, opt, device, dead_mask)
-                print(f"  [resample] epoch {epoch}: resampled {n_resampled} dead features")
-                if run:
-                    run.log({"resample/n_resampled": n_resampled, "epoch": epoch})
-                fired_this_interval.zero_()
-
-            train_metrics = {
-                "loss": running_loss / seen,
-            }
-            val_metrics = self.evaluate_sae(
-                val_loader,
-                device,
-                cfg,
-            )
-
-            history["train_loss"].append(train_metrics["loss"])
-            history["val_loss"].append(val_metrics["loss"])
-            history["val_active"].append(val_metrics["active"])
-            history["val_nonzero"].append(val_metrics["nonzero"])
-            history["val_fve"].append(val_metrics["fve"])
-            history["val_dead_frac"].append(val_metrics["dead_frac"])
-
-            if run:
-                run.log({
-                    "train/loss": train_metrics["loss"],
-                    "val/loss": val_metrics["loss"],
-                    "val/active_features": val_metrics["active"],
-                    "val/nonzero_features": val_metrics["nonzero"],
-                    "val/fve": val_metrics["fve"],
-                    "val/dead_frac": val_metrics["dead_frac"],
-                    "epoch": epoch,
-                })
-
-            print(
-                f"Epoch {epoch:02d} | "
-                f"train loss {train_metrics['loss']:.6f} | "
-                f"val loss {val_metrics['loss']:.6f} | "
-                f"fve {val_metrics['fve']:.3f} | dead {val_metrics['dead_frac']:.2%}"
-            )
-
-        # ---- Curves ----
-        if show_curves:
-            plt.figure(figsize=(12,4))
-            plt.plot(history["val_active"])
-            plt.title("Val active features/token")
-            plt.tight_layout()
-            plt.show()
-    
-        return self.sae, history
-    
-    def evaluate_sae(self, loader, device, cfg):
-        self.sae.eval()
-        total_loss, total_active, total_nonzero, n = (
-            0.0, 0.0, 0.0, 0,
-        )
-        # FVE accumulators — kept as tensors to avoid d_in-sized Python loops
-        x_sum = None
-        x_sq_sum = None
-        total_ss_res = 0.0
-        ever_active = None  # [d_latent] bool, tracks which features fired at least once
-
-        with torch.no_grad():
-            for (xb,) in loader:
-                xb = xb.to(device, non_blocking=True)
-                
-                x_hat, z = self.sae(xb)
-
-                loss = F.mse_loss(x_hat, xb)
-
-                az = z.abs()
-                row_sum = az.sum(dim=1, keepdim=True).clamp(min=1e-8)
-                frac = az / row_sum
-                active = (frac > cfg.mass_frac_threshold).float().sum(dim=1).mean()
-                nonzero = (z > 0).float().sum(dim=-1).mean()
-
-                # FVE: accumulate per-dimension sums for SS_tot, and SS_res
-                total_ss_res += ((x_hat - xb) ** 2).sum().item()
-                if x_sum is None:
-                    x_sum = xb.sum(dim=0)
-                    x_sq_sum = (xb ** 2).sum(dim=0)
-                else:
-                    x_sum += xb.sum(dim=0)
-                    x_sq_sum += (xb ** 2).sum(dim=0)
-
-                # Dead features: union of active features across all batches
-                fired = (z > 0).any(dim=0)
-                ever_active = fired if ever_active is None else (ever_active | fired)
-
-                bs = xb.size(0)
-                total_loss += loss.item() * bs
-                total_active += active.item() * bs
-                total_nonzero += nonzero.item() * bs
-                n += bs
-
-        # FVE = 1 - SS_res / SS_tot, where SS_tot = sum(x^2) - n*mean(x)^2
-        mean_x = x_sum / n
-        ss_tot = (x_sq_sum - n * mean_x ** 2).sum().item()
-        fve = 1.0 - total_ss_res / max(ss_tot, 1e-8)
-
-        dead_frac = (~ever_active).float().mean().item()
-
-        out = {
-            "loss": total_loss / n,
-            "active": total_active / n,
-            "nonzero": total_nonzero / n,
-            "fve": fve,
-            "dead_frac": dead_frac,
-        }
-        return out
+    def _eval_step(self, xb, _cfg):
+        x_hat, z = self.sae(xb)
+        loss = F.mse_loss(x_hat, xb)
+        return x_hat, z, {"loss": loss.item(), "recon": loss.item(), "l1": 0.0, "kl": 0.0}
