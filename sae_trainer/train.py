@@ -16,9 +16,9 @@ from datasets import load_dataset
 import wandb
 
 from .dataset_utils import make_collate_fn, TextDataset, get_data_loaders
-from .train_utils import train_sae
+from .sae_training_module import ReluSAETrainingModule, TopKSAETrainingModule
 from .eval_utils import evaluate_sae, visualize_sae
-from .model_utils import SparseAutoencoder, TopKSparseAutoencoder
+from .model_utils import ReluSparseAutoencoder, TopKSparseAutoencoder
 from .activation_collector_utils import GPT2ActivationCollector, QwenActivationCollector
 
 def load_config(path: str) -> SimpleNamespace:
@@ -45,33 +45,22 @@ def training_wrapper(cfg, accum, layer_idx, device, save_mode=False, show_curves
     d_latent = d_in * expansion # d_in = 3584, so this should be in ~[14k, 60k] (14336-57344)
 
     if cfg.sae_type == "topk":
-        sae = TopKSparseAutoencoder(d_in=d_in, d_latent=d_latent, k=cfg.k, normalize_decoder=cfg.normalize_decoder).to(device)
+        sae_training_module = TopKSAETrainingModule(d_in=d_in, d_latent=d_latent, k=cfg.k, normalize_decoder=cfg.normalize_decoder, device=device)
     else:
-        sae = SparseAutoencoder(d_in=d_in, d_latent=d_latent, normalize_decoder=cfg.normalize_decoder).to(device)
-    opt = torch.optim.AdamW(sae.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-
-    # Sparsity strength: tune this. Start small.
-    lambda_l1 = cfg.lambda_l1
+        sae_training_module = ReluSAETrainingModule(d_in=d_in, d_latent=d_latent, normalize_decoder=cfg.normalize_decoder, device=device)
+    opt = torch.optim.AdamW(sae_training_module.sae.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     # Optional: LR scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.num_epochs)
     #scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=5)
 
-    sae, history = train_sae(
-        sae,
+    sae, history = sae_training_module.train_sae(
         train_loader,
         val_loader,
         opt,
         scheduler,
         device,
-        lambda_l1=lambda_l1,
-        show_curves=show_curves,
-        mass_frac_threshold=cfg.mass_frac_threshold,
-        lambda_kl=cfg.lambda_kl,
-        target_firing_rate=cfg.target_firing_rate,
-        num_epochs=cfg.num_epochs,
-        lambda_l1_warmup_epochs=cfg.lambda_l1_warmup_epochs,
-        resample_interval_epochs=cfg.resample_interval_epochs,
+        cfg=cfg,
         run=run,
         )
 
@@ -79,13 +68,12 @@ def training_wrapper(cfg, accum, layer_idx, device, save_mode=False, show_curves
         run.finish()
 
     if save_mode:
-        save_filename = f"sae_{cfg.model_name}_{cfg.dataset_name}_layer{layer_idx}.pt"
+        save_filename = f"{cfg.sae_type}_sae_{cfg.model_name}_{cfg.dataset_name}_layer{layer_idx}.pt"
         # ---- Save checkpoint ----
         ckpt = {
             "model_state": sae.state_dict(),
             "d_in": d_in,
             "d_latent": d_latent,
-            "lambda_l1": lambda_l1,
             "act_scale": act_scale.item(),
             "history": history,
         }

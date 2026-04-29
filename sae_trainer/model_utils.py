@@ -1,7 +1,6 @@
+from abc import ABC, abstractmethod
+
 import torch
-from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from typing import List, Dict, Optional
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -27,58 +26,49 @@ def firing_rate_kl_loss(
     return kl.mean()
 
 
-# ---- Simple ReLU SAE ----
-class SparseAutoencoder(nn.Module):
+class SparseAutoencoder(nn.Module, ABC):
     def __init__(self, d_in: int, d_latent: int, normalize_decoder: bool = True):
         super().__init__()
+        self.normalize_decoder = normalize_decoder
         self.encoder = nn.Linear(d_in, d_latent, bias=True)
         self.decoder = nn.Linear(d_latent, d_in, bias=False)
-        self.normalize_decoder = normalize_decoder
 
         nn.init.xavier_uniform_(self.encoder.weight)
         nn.init.xavier_uniform_(self.decoder.weight)
 
-    def forward(self, x, return_pre_relu: bool = False):
-        h = self.encoder(x)
-        z = F.relu(h)  # [B, d_latent], sparse nonnegative code
+    def _decode(self, z: torch.Tensor) -> torch.Tensor:
         if self.normalize_decoder:
-            # decoder.weight: [d_in, d_latent] — one column per dictionary atom
             W = self.decoder.weight
             scale = W.norm(dim=0, keepdim=True).clamp(min=1e-8)
             W = W / scale
-            x_hat = F.linear(z, W, self.decoder.bias)
-        else:
-            x_hat = self.decoder(z)
+            return F.linear(z, W, self.decoder.bias)
+        return self.decoder(z)
+
+    @abstractmethod
+    def forward(self, x: torch.Tensor):
+        ...
+
+
+# ---- ReLU SAE ----
+class ReluSparseAutoencoder(SparseAutoencoder):
+    def forward(self, x: torch.Tensor, return_pre_relu: bool = False):
+        h = self.encoder(x)
+        z = F.relu(h)
+        x_hat = self._decode(z)
         if return_pre_relu:
             return x_hat, z, h
         return x_hat, z
 
 
 # ---- Top-K SAE ----
-class TopKSparseAutoencoder(nn.Module):
+class TopKSparseAutoencoder(SparseAutoencoder):
     def __init__(self, d_in: int, d_latent: int, k: int, normalize_decoder: bool = True):
-        super().__init__()
+        super().__init__(d_in, d_latent, normalize_decoder)
         self.k = k
-        self.normalize_decoder = normalize_decoder
-        self.encoder = nn.Linear(d_in, d_latent, bias=True)
-        self.decoder = nn.Linear(d_latent, d_in, bias=False)
 
-        nn.init.xavier_uniform_(self.encoder.weight)
-        nn.init.xavier_uniform_(self.decoder.weight)
-
-    def forward(self, x, return_pre_relu: bool = False):
+    def forward(self, x: torch.Tensor):
         h = self.encoder(x)
-        # Keep only the top-k activations per token, zero the rest
         topk_vals, topk_idx = torch.topk(h, self.k, dim=-1)
-        topk_vals = F.relu(topk_vals)  # ensure non-negative
+        topk_vals = F.relu(topk_vals)
         z = torch.zeros_like(h).scatter_(-1, topk_idx, topk_vals)
-
-        if self.normalize_decoder:
-            W = self.decoder.weight
-            scale = W.norm(dim=0, keepdim=True).clamp(min=1e-8)
-            W = W / scale
-            x_hat = F.linear(z, W, self.decoder.bias)
-        else:
-            x_hat = self.decoder(z)
-
-        return x_hat, z
+        return self._decode(z), z
