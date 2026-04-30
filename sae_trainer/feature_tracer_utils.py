@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from collections import defaultdict
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Literal
 import torch
 import pandas as pd
 
@@ -16,6 +16,10 @@ class TraceConfig:
     repetition_penalty: float = 1.0   # >1 discourages repetition; 1.3-1.5 works well for GPT-2
     stop_strings: Optional[List[str]] = None  # e.g. ["\n"] to stop at first newline
     context_window: int = 8
+    # "all"            — include both prompt and generated tokens
+    # "generated_only" — exclude prompt tokens (default, previous behaviour)
+    # "prompt_only"    — exclude generated tokens
+    token_mode: Literal["all", "generated_only", "prompt_only"] = "generated_only"
 
 
 class FeatureTracer:
@@ -87,7 +91,7 @@ class FeatureTracer:
 
     # ---------- Core tracing ----------
     @torch.no_grad()
-    def trace_prompt(self, prompt: str, prompt_id: Optional[str] = None, system_prompt: Optional[str] = None, exclude_prompt_tokens: bool = True) -> Dict:
+    def trace_prompt(self, prompt: str, prompt_id: Optional[str] = None, system_prompt: Optional[str] = None) -> Dict:
         self._captured_hidden = []
         self._register_hook()
 
@@ -134,7 +138,9 @@ class FeatureTracer:
         pid = prompt_id if prompt_id is not None else str(len(self._rows))
 
         for pos in range(min(len(tokens), Z.shape[0])):
-            if exclude_prompt_tokens and pos < num_prompt_tokens:
+            if self.cfg.token_mode == "generated_only" and pos < num_prompt_tokens:
+                continue
+            if self.cfg.token_mode == "prompt_only" and pos >= num_prompt_tokens:
                 continue
             for j in range(top_idx.shape[1]):
                 val = float(top_vals[pos, j])
@@ -162,11 +168,11 @@ class FeatureTracer:
             "num_hits": sum(1 for r in self._rows if r["prompt_id"] == pid),
         }
 
-    def trace_prompts(self, prompts: List[str], ids: Optional[List[str]] = None, system_prompt: Optional[str] = None, exclude_prompt_tokens: bool = True) -> List[Dict]:
+    def trace_prompts(self, prompts: List[str], ids: Optional[List[str]] = None, system_prompt: Optional[str] = None) -> List[Dict]:
         summaries = []
         for i, p in enumerate(prompts):
             pid = ids[i] if ids is not None else f"p{i}"
-            summaries.append(self.trace_prompt(p, prompt_id=pid, system_prompt=system_prompt, exclude_prompt_tokens=exclude_prompt_tokens))
+            summaries.append(self.trace_prompt(p, prompt_id=pid, system_prompt=system_prompt))
         return summaries
 
     def trace_prompts_from_iterable_dataset(
@@ -176,14 +182,13 @@ class FeatureTracer:
             truncation_limit: int = 150,
             max_prompts_to_trace: Optional[int] = None,
             system_prompt: Optional[str] = None,
-            exclude_prompt_tokens: bool = True,
         ) -> List[Dict]:
         summaries = []
         num_traced = 0
         for row in ds:
             text = row["text"].strip()
             if len(text.split()) >= min_prompt_words:
-                summaries.append(self.trace_prompt(" ".join(text.split()[:truncation_limit]), prompt_id=num_traced, system_prompt=system_prompt, exclude_prompt_tokens=exclude_prompt_tokens))
+                summaries.append(self.trace_prompt(" ".join(text.split()[:truncation_limit]), prompt_id=num_traced, system_prompt=system_prompt))
                 num_traced += 1
             if max_prompts_to_trace and num_traced >= max_prompts_to_trace:
                 break
