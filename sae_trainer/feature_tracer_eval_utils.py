@@ -216,6 +216,7 @@ def plot_feature_umap(
     random_state: int = 42,
     figsize=(10, 7),
     include_token_level_plot=False,
+    specificity_type: str = 'context'
 ):
     """
     Two separate UMAP figures (shown one after the other), if include_token_level_plot is True:
@@ -224,7 +225,7 @@ def plot_feature_umap(
        Shows whether each feature's activating contexts cluster tightly. Controlled by include_token_level_plot
 
     2) Centroid-level: each point is one feature (mean embedding).
-       Point size = hit count, color = specificity_vs_baseline (if scores provided).
+       Point size = hit count, color = f'{specificity_type}_specificity_vs_baseline' (if scores provided).
        Shows the broader feature landscape and how features relate to each other.
 
     figsize applies to each figure independently.
@@ -239,7 +240,12 @@ def plot_feature_umap(
     # --- Usage ---
     # scores = tracer.feature_specificity_scores(feature_embeddings=embeddings)
     # plot_feature_umap(embeddings, specificity_scores=scores, top_n=20)
-    specificity_scores = tracer.feature_specificity_scores()
+    if specificity_type =='context':
+        specificity_scores = tracer.get_feature_context_specificity_scores()
+    elif specificity_type == 'token':
+        specificity_scores = tracer.get_feature_token_specificity_scores()
+    else:
+        raise ValueError(f"specificity_type must be either 'context' or 'token', received {specificity_type}")
     feature_embeddings = tracer.get_feature_embeddings()
 
 
@@ -262,8 +268,8 @@ def plot_feature_umap(
     # --- Build token-level arrays ---
     all_embs, all_labels = [], []
     for fid, data in selected.items():
-        all_embs.append(data["embeddings"])
-        all_labels.extend([fid] * len(data["embeddings"]))
+        all_embs.append(data[f"{specificity_type}_embeddings"])
+        all_labels.extend([fid] * len(data[f"{specificity_type}_embeddings"]))
 
     all_embs = np.concatenate(all_embs, axis=0)
     all_labels = np.array(all_labels)
@@ -317,17 +323,17 @@ def plot_feature_umap(
 
     # --- Figure 2: centroid-level ---
     fig2, ax2 = plt.subplots(figsize=figsize)
-    if specificity_scores is not None and "specificity_vs_baseline" in specificity_scores.columns:
-        score_map = specificity_scores.set_index("feature_id")["specificity_vs_baseline"]
+    if specificity_scores is not None and f"{specificity_type}_specificity_vs_baseline" in specificity_scores.columns:
+        score_map = specificity_scores.set_index("feature_id")[f"{specificity_type}_specificity_vs_baseline"]
         spec_values = np.array([score_map.get(fid, 0.0) for fid in top_fids])
-        full_col = specificity_scores["specificity_vs_baseline"].dropna()
+        full_col = specificity_scores[f"{specificity_type}_specificity_vs_baseline"].dropna()
         sc = ax2.scatter(
             centroids_2d[:, 0], centroids_2d[:, 1],
             s=marker_sizes, c=spec_values, cmap="RdYlGn",
             vmin=full_col.min(), vmax=full_col.max(),
             alpha=0.85, linewidths=0.5, edgecolors="grey",
         )
-        fig2.colorbar(sc, ax=ax2, label="specificity_vs_baseline")
+        fig2.colorbar(sc, ax=ax2, label=f"{specificity_type}_specificity_vs_baseline")
     else:
         centroid_colors = [color_map[fid] for fid in top_fids]
         ax2.scatter(
@@ -354,6 +360,7 @@ def plot_feature_similarity_violins(
     bottom_n: int | None = None,
     mask_same_context: bool = True,
     figsize: tuple = (14, 5),
+    specificity_type: str = 'context'
 ):
     """
     Violin plot of pairwise cosine similarities for each feature's context embeddings.
@@ -365,14 +372,19 @@ def plot_feature_similarity_violins(
     if top_n is not None and bottom_n is not None:
         raise ValueError('Must provide either top_n or bottom_n, not both')
     
-    scores = tracer.feature_specificity_scores()
+    if specificity_type =='context':
+        scores = tracer.get_feature_context_specificity_scores()
+    elif specificity_type == 'token':
+        scores = tracer.get_feature_token_specificity_scores()
+    else:
+        raise ValueError(f"specificity_type must be either 'context' or 'token', received {specificity_type}")
     feature_embeddings = tracer.get_feature_embeddings()
 
     if scores is None or scores.empty or feature_embeddings is None:
         print("No specificity scores available. Run tracer.feature_specificity_scores() first.")
         return
 
-    ranked = scores.dropna(subset=["specificity_vs_baseline"])
+    ranked = scores.dropna(subset=[f"{specificity_type}_specificity_vs_baseline"])
     if bottom_n is not None:
         selected_fids = ranked.tail(bottom_n)["feature_id"].tolist()
     else:
@@ -385,7 +397,7 @@ def plot_feature_similarity_violins(
         data = feature_embeddings.get(fid)
         if data is None:
             continue
-        emb = data["embeddings"]           # [n, d], unit-normed
+        emb = data[f"{specificity_type}_embeddings"]           # [n, d], unit-normed
         pids = np.array(data["prompt_ids"]) if "prompt_ids" in data else None
         n = len(emb)
         if n < 2:
@@ -409,7 +421,7 @@ def plot_feature_similarity_violins(
     ordered_labels = [str(fid) for fid in top_fids if str(fid) in plot_df["feature_id"].values]
 
     # Baseline: mean random-pair similarity across all features
-    all_emb = np.concatenate([feature_embeddings[fid]["embeddings"] for fid in feature_embeddings])
+    all_emb = np.concatenate([feature_embeddings[fid][f"{specificity_type}_embeddings"] for fid in feature_embeddings])
     rng = np.random.default_rng(42)
     idx = rng.choice(len(all_emb), size=(min(1000, len(all_emb)), 2))
     baseline = float((all_emb[idx[:, 0]] * all_emb[idx[:, 1]]).sum(axis=1).mean())
@@ -425,12 +437,13 @@ def plot_feature_similarity_violins(
         ax=ax,
     )
     ax.axhline(baseline, color="red", linestyle="--", linewidth=1.2, label=f"baseline ({baseline:.3f})")
+    level = specificity_type.capitalize()
     if bottom_n is not None:
         xlabel = "feature_id  (ordered by specificity_vs_baseline, low → high)"
-        title  = f"Context similarity distributions — bottom {len(ordered_labels)} features"
+        title  = f"{level} similarity distributions — bottom {len(ordered_labels)} features"
     else:
         xlabel = "feature_id  (ordered by specificity_vs_baseline, high → low)"
-        title  = f"Context similarity distributions — top {len(ordered_labels)} features"
+        title  = f"{level} similarity distributions — top {len(ordered_labels)} features"
     ax.set_xlabel(xlabel, fontsize=9)
     ax.set_ylabel("pairwise cosine similarity", fontsize=9)
     ax.set_title(title, fontsize=11)
@@ -440,7 +453,7 @@ def plot_feature_similarity_violins(
     plt.show()
 
 
-def compute_inter_feature_similarity(feature_embeddings: dict) -> tuple[np.ndarray, list]:
+def compute_inter_feature_similarity(feature_embeddings: dict, specificity_type: str = 'context') -> tuple[np.ndarray, list]:
     """
     Compute pairwise cosine similarity between feature centroids.
 
@@ -455,7 +468,7 @@ def compute_inter_feature_similarity(feature_embeddings: dict) -> tuple[np.ndarr
 
     centroids = []
     for fid in feature_ids:
-        emb = feature_embeddings[fid]["embeddings"]  # [n, d], unit-normed
+        emb = feature_embeddings[fid][f"{specificity_type}_embeddings"]  # [n, d], unit-normed
         centroid = emb.mean(axis=0)
         # Re-normalize so centroid is also unit-length for valid cosine sim
         centroid = centroid / (np.linalg.norm(centroid) + 1e-8)
@@ -472,6 +485,7 @@ def plot_inter_feature_similarity(
     top_n: int = 30,            # restrict to top-N features by specificity
     figsize=(12, 10),
     annot_threshold: float = 0.5,  # annotate cells above this similarity value
+    specificity_type: str = 'context'
 ):
     """
     Heatmap of pairwise cosine similarity between feature centroids.
@@ -493,8 +507,14 @@ def plot_inter_feature_similarity(
     # )
     # Select and order features
 
-    specificity_scores = tracer.feature_specificity_scores()
+    if specificity_type =='context':
+        specificity_scores = tracer.get_feature_context_specificity_scores()
+    elif specificity_type == 'token':
+        specificity_scores = tracer.get_feature_token_specificity_scores()
+    else:
+        raise ValueError(f"specificity_type must be either 'context' or 'token', received {specificity_type}")
     feature_embeddings = tracer.get_feature_embeddings()
+
 
     if specificity_scores is not None and not specificity_scores.empty:
         ordered_fids = specificity_scores.head(top_n)["feature_id"].tolist()
@@ -507,7 +527,7 @@ def plot_inter_feature_similarity(
         )[:top_n]
 
     subset = {fid: feature_embeddings[fid] for fid in ordered_fids}
-    sim_matrix, feature_ids = compute_inter_feature_similarity(subset)
+    sim_matrix, feature_ids = compute_inter_feature_similarity(subset, specificity_type)
 
     # Build labels — feature_id plus hit count for context
     labels = [
@@ -565,3 +585,95 @@ def plot_inter_feature_similarity(
         print(f"\nNo pairs with cosine_sim >= {annot_threshold} — features appear well-separated.")
 
     return sim_matrix, feature_ids
+
+
+def plot_feature_specificity_scatter(
+    tracer: FeatureTracer,
+    top_n: int | None = None,
+    figsize: tuple = (9, 7),
+    annotate_n: int = 10,
+):
+    """
+    Scatterplot with context_specificity_vs_baseline on the x-axis and
+    token_specificity_vs_baseline on the y-axis.
+
+    Each point is one feature.  Dashed lines at x=0 / y=0 divide the plot
+    into four interpretable quadrants:
+
+        High context + High token  → concept-specific features
+        Low  context + High token  → token-specific, context-agnostic (e.g. "the")
+        High context + Low  token  → context-specific, token-diverse
+        Low  context + Low  token  → noisy or near-dead
+
+    Point size  = hit count (larger = fires more often)
+    Point color = composite_score (green = genuinely active + specific)
+
+    Parameters
+    ----------
+    top_n : restrict to the top-N features by composite_score (None = all features)
+    annotate_n : label the top-N features by composite_score with their feature_id
+    """
+    scores_df = tracer.get_feature_specificity_scores_df()
+    if scores_df is None or scores_df.empty:
+        print("No specificity scores available. Run tracer.feature_specificity_scores() first.")
+        return
+
+    df = scores_df.dropna(subset=["context_specificity_vs_baseline", "token_specificity_vs_baseline"]).copy()
+    if df.empty:
+        print("Scores DataFrame has no rows with both context and token specificity.")
+        return
+
+    if top_n is not None:
+        df = df.nlargest(top_n, "composite_score")
+
+    x = df["context_specificity_vs_baseline"].values
+    y = df["token_specificity_vs_baseline"].values
+    sizes = 30 + 200 * (df["hits"].values / df["hits"].values.max())
+    colors = df["composite_score"].values
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    sc = ax.scatter(
+        x, y,
+        s=sizes,
+        c=colors,
+        cmap="RdYlGn",
+        alpha=0.85,
+        linewidths=0.4,
+        edgecolors="grey",
+    )
+    fig.colorbar(sc, ax=ax, label="composite_score")
+
+    # Quadrant dividers
+    ax.axvline(0, color="#888", linestyle="--", linewidth=0.9, zorder=0)
+    ax.axhline(0, color="#888", linestyle="--", linewidth=0.9, zorder=0)
+
+    # Quadrant labels
+    xmin, xmax = ax.get_xlim()
+    ymin, ymax = ax.get_ylim()
+    pad = 0.03
+    quad_kw = dict(fontsize=7.5, color="#555", ha="center", va="center", style="italic")
+    ax.text(xmin + (0 - xmin) * 0.5, ymax - (ymax - 0) * pad * 2, "context-specific\ntoken-diverse",  **quad_kw)
+    ax.text(xmax - (xmax - 0) * 0.5, ymax - (ymax - 0) * pad * 2, "concept-specific",               **quad_kw)
+    ax.text(xmin + (0 - xmin) * 0.5, ymin + (0 - ymin) * pad * 2, "noisy / near-dead",              **quad_kw)
+    ax.text(xmax - (xmax - 0) * 0.5, ymin + (0 - ymin) * pad * 2, "token-specific\ncontext-agnostic", **quad_kw)
+
+    # Annotate top features by composite_score
+    if annotate_n and annotate_n > 0:
+        top_rows = df.nlargest(annotate_n, "composite_score")
+        for _, row in top_rows.iterrows():
+            ax.annotate(
+                str(int(row["feature_id"])),
+                (row["context_specificity_vs_baseline"], row["token_specificity_vs_baseline"]),
+                fontsize=6.5,
+                xytext=(4, 4),
+                textcoords="offset points",
+                color="#222",
+            )
+
+    ax.set_xlabel("context_specificity_vs_baseline", fontsize=10)
+    ax.set_ylabel("token_specificity_vs_baseline", fontsize=10)
+    n_label = f"top {len(df)}" if top_n is not None else f"all {len(df)}"
+    ax.set_title(f"Feature specificity landscape ({n_label} features)\nsize = hits, color = composite_score", fontsize=11)
+    fig.tight_layout()
+    plt.show()

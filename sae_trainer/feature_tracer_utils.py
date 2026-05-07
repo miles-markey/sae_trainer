@@ -1,8 +1,8 @@
 from dataclasses import dataclass
-from collections import defaultdict
-from typing import List, Dict, Tuple, Optional, Literal
+from typing import List, Dict, Optional, Literal
 import torch
 import pandas as pd
+import numpy as np
 
 
 @dataclass
@@ -43,6 +43,7 @@ class FeatureTracer:
         self._captured_hidden: List[torch.Tensor] = []
         self._rows: List[dict] = []
         self._feature_embeddings = None
+        self._feature_specificity_scores_df = None
 
     # ---------- Hooking ----------
     def _hook_fn(self, module, inputs, output):
@@ -310,22 +311,24 @@ class FeatureTracer:
         batch_size: int = 64,
     ) -> Dict[int, Dict]:
         """
-        For each feature, embed its top activating context windows using a
-        sentence-transformer model.
+        For each feature, embed its top activating context windows and the
+        activating tokens themselves using a sentence-transformer model.
 
         Returns a dict keyed by feature_id:
           {
-            "embeddings": np.ndarray [n, d],   # one row per context
-            "activations": np.ndarray [n],     # corresponding activation values
-            "contexts": List[str],             # decoded context strings
+            "embeddings":       np.ndarray [n, d],  # context window embeddings
+            "token_embeddings": np.ndarray [n, d],  # token-only embeddings
+            "activations":      np.ndarray [n],
+            "contexts":         List[str],
+            "tokens":           List[str],          # clean (decoded) token strings
+            "prompt_ids":       List,
+            "token_positions":  np.ndarray [n],
           }
         """
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError:
             raise ImportError("pip install sentence-transformers")
-
-        import numpy as np
 
         embed_model = SentenceTransformer(model_name)
 
@@ -343,21 +346,29 @@ class FeatureTracer:
             activations = ctx_df["activation"].to_numpy()
             prompt_ids = ctx_df["prompt_id"].tolist()
             token_positions = ctx_df["token_pos"].to_numpy()
+            # Decode BPE tokens to clean strings (e.g. "Ġmilitary" → "military")
+            tokens = [
+                self.tokenizer.convert_tokens_to_string([t])
+                for t in ctx_df["token"].tolist()
+            ]
 
-            embeddings = embed_model.encode(
-                contexts,
+            encode_kwargs = dict(
                 batch_size=batch_size,
                 show_progress_bar=False,
                 convert_to_numpy=True,
-                normalize_embeddings=True,  # unit-norm so cosine sim = dot product
+                normalize_embeddings=True,
             )
+            embeddings = embed_model.encode(contexts, **encode_kwargs)
+            token_embeddings = embed_model.encode(tokens,   **encode_kwargs)
 
             results[fid] = {
-                "embeddings": embeddings,
-                "activations": activations,
-                "contexts": contexts,
-                "prompt_ids": prompt_ids,
-                "token_positions": token_positions,
+                "context_embeddings":       embeddings,
+                "token_embeddings": token_embeddings,
+                "activations":      activations,
+                "contexts":         contexts,
+                "tokens":           tokens,
+                "prompt_ids":       prompt_ids,
+                "token_positions":  token_positions,
             }
 
         return results
@@ -383,7 +394,9 @@ class FeatureTracer:
         Returns a DataFrame with columns:
           feature_id, hits, mean_activation, specificity, specificity_vs_baseline
         """
-        import numpy as np
+
+        if self._feature_specificity_scores_df is not None:
+            return self._feature_specificity_scores_df
 
         if self._feature_embeddings is None:
             self._feature_embeddings = self.compute_feature_embeddings(
@@ -412,7 +425,8 @@ class FeatureTracer:
         # Compute per-feature scores
         rows = []
         for fid, data in self._feature_embeddings.items():
-            emb = data["embeddings"]
+            emb = data["context_embeddings"]
+            tok_emb = data.get("token_embeddings")
             acts = data["activations"]
             n = len(acts)
 
@@ -432,32 +446,82 @@ class FeatureTracer:
             else:
                 valid_pairs_mask = np.ones((n, n), dtype=bool)
 
-            score = _weighted_mean_cosine(emb, weights, valid_pairs_mask)
+            context_score = _weighted_mean_cosine(emb, weights, valid_pairs_mask)
+
+            token_score = (
+                _weighted_mean_cosine(tok_emb, weights, valid_pairs_mask)
+                if tok_emb is not None
+                else float("nan")
+            )
+
             rows.append({
                 "feature_id": fid,
                 "hits": len(acts),
                 "n_prompts": n_distinct_prompts,
                 "mean_activation": float(acts.mean()),
-                "specificity": score,
+                "context_specificity": context_score,
+                "token_specificity": token_score,
             })
 
         result_df = pd.DataFrame(rows)
         if result_df.empty:
             return result_df
 
-        # Baseline: mean cosine sim between random context pairs across all features
-        all_embeddings = np.concatenate([d["embeddings"] for d in self._feature_embeddings.values()])
-        rng = np.random.default_rng(42)
-        n_baseline = min(1000, len(all_embeddings))
-        idx = rng.choice(len(all_embeddings), size=(n_baseline, 2))
-        baseline = float((all_embeddings[idx[:, 0]] * all_embeddings[idx[:, 1]]).sum(axis=1).mean())
+        def _random_baseline(embeddings_list, rng, n=1000):
+            all_emb = np.concatenate(embeddings_list)
+            idx = rng.choice(len(all_emb), size=(min(n, len(all_emb)), 2))
+            return float((all_emb[idx[:, 0]] * all_emb[idx[:, 1]]).sum(axis=1).mean())
 
-        result_df["specificity_vs_baseline"] = result_df["specificity"] - baseline
-        result_df = result_df.sort_values("specificity_vs_baseline", ascending=False).reset_index(drop=True)
+        rng = np.random.default_rng(42)
+        context_baseline = _random_baseline(
+            [d["context_embeddings"] for d in self._feature_embeddings.values()], rng
+        )
+        token_baseline = _random_baseline(
+            [d["token_embeddings"] for d in self._feature_embeddings.values()
+             if "token_embeddings" in d], rng
+        )
+
+        result_df["context_specificity_vs_baseline"] = result_df["context_specificity"] - context_baseline
+        result_df["token_specificity_vs_baseline"] = result_df["token_specificity"] - token_baseline
+        result_df["composite_score"] = result_df["context_specificity_vs_baseline"] * result_df["mean_activation"]
+        result_df = result_df.sort_values("context_specificity_vs_baseline", ascending=False).reset_index(drop=True)
+        
+        self._feature_specificity_scores_df = result_df
+        
         return result_df
+
+    def get_feature_specificity_scores_df(self):
+        if self._feature_specificity_scores_df is None:
+            raise RuntimeError("Call feature_specificity_scores() first.")
+        return self._feature_specificity_scores_df
 
     def get_feature_embeddings(self):
         return self._feature_embeddings
+
+    def get_feature_context_specificity_scores(self):
+        if self._feature_specificity_scores_df is None:
+            raise RuntimeError("Call feature_specificity_scores() first.")
+        return (
+            self._feature_specificity_scores_df[
+                ["feature_id", "hits", "n_prompts", "mean_activation",
+                 "context_specificity", "context_specificity_vs_baseline"]
+            ]
+            .sort_values("context_specificity_vs_baseline", ascending=False)
+            .reset_index(drop=True)
+        )
+
+    def get_feature_token_specificity_scores(self):
+        if self._feature_specificity_scores_df is None:
+            raise RuntimeError("Call feature_specificity_scores() first.")
+        return (
+            self._feature_specificity_scores_df[
+                ["feature_id", "hits", "n_prompts", "mean_activation",
+                 "token_specificity", "token_specificity_vs_baseline"]
+            ]
+            .sort_values("token_specificity_vs_baseline", ascending=False)
+            .reset_index(drop=True)
+        )
+
     
     def save_csv(self, path: str):
         self.to_dataframe().to_csv(path, index=False)
