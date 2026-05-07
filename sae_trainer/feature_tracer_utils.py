@@ -182,11 +182,12 @@ class FeatureTracer:
             truncation_limit: int = 150,
             max_prompts_to_trace: Optional[int] = None,
             system_prompt: Optional[str] = None,
+            prompt_key: Optional[str] = 'text'
         ) -> List[Dict]:
         summaries = []
         num_traced = 0
         for row in ds:
-            text = row["text"].strip()
+            text = row[prompt_key].strip()
             if len(text.split()) >= min_prompt_words:
                 summaries.append(self.trace_prompt(" ".join(text.split()[:truncation_limit]), prompt_id=num_traced, system_prompt=system_prompt))
                 num_traced += 1

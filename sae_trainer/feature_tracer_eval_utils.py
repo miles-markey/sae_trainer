@@ -215,12 +215,13 @@ def plot_feature_umap(
     top_n: int = 20,           # restrict to top-N features by specificity to keep plot readable
     random_state: int = 42,
     figsize=(10, 7),
+    include_token_level_plot=False,
 ):
     """
-    Two separate UMAP figures (shown one after the other):
+    Two separate UMAP figures (shown one after the other), if include_token_level_plot is True:
 
     1) Token-level: each point is one context window embedding, colored by feature_id.
-       Shows whether each feature's activating contexts cluster tightly.
+       Shows whether each feature's activating contexts cluster tightly. Controlled by include_token_level_plot
 
     2) Centroid-level: each point is one feature (mean embedding).
        Point size = hit count, color = specificity_vs_baseline (if scores provided).
@@ -284,31 +285,46 @@ def plot_feature_umap(
     hit_counts = np.array([len(selected[fid]["activations"]) for fid in top_fids])
     marker_sizes = 50 + 200 * (hit_counts / hit_counts.max())  # scale dot size by hits
 
-    # --- Figure 1: token-level ---
-    fig1, ax1 = plt.subplots(figsize=figsize)
-    ax1.scatter(token_2d[:, 0], token_2d[:, 1], c=colors, s=8, alpha=0.6, linewidths=0)
-    for i, fid in enumerate(top_fids):
-        ax1.annotate(
-            str(fid), centroids_2d[i],
-            fontsize=7, ha="center", va="center",
-            fontweight="bold", color=color_map[fid],
-        )
-    ax1.set_title(f"Token-level embeddings (top {len(top_fids)} features)", fontsize=11)
-    ax1.set_xlabel("UMAP-1")
-    ax1.set_ylabel("UMAP-2")
-    ax1.axis("off")
-    fig1.suptitle("Feature Embedding Landscape — token level", fontsize=13, y=1.02)
-    fig1.tight_layout()
-    plt.show()
+    if include_token_level_plot:
+        # --- Figure 1: token-level ---
+        fig1, ax1 = plt.subplots(figsize=figsize)
+        ax1.scatter(token_2d[:, 0], token_2d[:, 1], c=colors, s=18, alpha=0.7, linewidths=0)
+
+        # Clip axis limits to 1st–99th percentile to remove outlier-driven whitespace
+        x_lo, x_hi = np.percentile(token_2d[:, 0], [1, 99])
+        y_lo, y_hi = np.percentile(token_2d[:, 1], [1, 99])
+        margin = 0.08
+        ax1.set_xlim(x_lo - margin * (x_hi - x_lo), x_hi + margin * (x_hi - x_lo))
+        ax1.set_ylim(y_lo - margin * (y_hi - y_lo), y_hi + margin * (y_hi - y_lo))
+
+        # Legend — one patch per feature
+        legend_handles = [
+            plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=color_map[fid],
+                       markersize=7, label=str(fid))
+            for fid in top_fids
+        ]
+        ax1.legend(handles=legend_handles, title="feature_id", fontsize=7,
+                   title_fontsize=7, loc="best", framealpha=0.7,
+                   ncol=max(1, len(top_fids) // 10))
+
+        ax1.set_title(f"Token-level embeddings (top {len(top_fids)} features)", fontsize=11)
+        ax1.set_xlabel("UMAP-1")
+        ax1.set_ylabel("UMAP-2")
+        ax1.axis("off")
+        fig1.suptitle("Feature Embedding Landscape — token level", fontsize=13, y=1.02)
+        fig1.tight_layout()
+        plt.show()
 
     # --- Figure 2: centroid-level ---
     fig2, ax2 = plt.subplots(figsize=figsize)
     if specificity_scores is not None and "specificity_vs_baseline" in specificity_scores.columns:
         score_map = specificity_scores.set_index("feature_id")["specificity_vs_baseline"]
         spec_values = np.array([score_map.get(fid, 0.0) for fid in top_fids])
+        full_col = specificity_scores["specificity_vs_baseline"].dropna()
         sc = ax2.scatter(
             centroids_2d[:, 0], centroids_2d[:, 1],
             s=marker_sizes, c=spec_values, cmap="RdYlGn",
+            vmin=full_col.min(), vmax=full_col.max(),
             alpha=0.85, linewidths=0.5, edgecolors="grey",
         )
         fig2.colorbar(sc, ax=ax2, label="specificity_vs_baseline")
@@ -330,6 +346,99 @@ def plot_feature_umap(
     fig2.suptitle("Feature Embedding Landscape — centroids", fontsize=13, y=1.02)
     fig2.tight_layout()
     plt.show()
+
+
+def plot_feature_similarity_violins(
+    tracer: FeatureTracer,
+    top_n: int | None = 20,
+    bottom_n: int | None = None,
+    mask_same_context: bool = True,
+    figsize: tuple = (14, 5),
+):
+    """
+    Violin plot of pairwise cosine similarities for each feature's context embeddings.
+
+    Each violin shows the distribution of all cross-prompt pairwise similarities for
+    one feature. Features are ordered left-to-right by specificity_vs_baseline (highest
+    first). A dashed baseline shows the mean random-pair similarity across all features.
+    """
+    if top_n is not None and bottom_n is not None:
+        raise ValueError('Must provide either top_n or bottom_n, not both')
+    
+    scores = tracer.feature_specificity_scores()
+    feature_embeddings = tracer.get_feature_embeddings()
+
+    if scores is None or scores.empty or feature_embeddings is None:
+        print("No specificity scores available. Run tracer.feature_specificity_scores() first.")
+        return
+
+    ranked = scores.dropna(subset=["specificity_vs_baseline"])
+    if bottom_n is not None:
+        selected_fids = ranked.tail(bottom_n)["feature_id"].tolist()
+    else:
+        selected_fids = ranked.head(top_n)["feature_id"].tolist()
+    top_fids = selected_fids
+
+    # Build per-feature pairwise similarity distributions
+    records = []
+    for fid in top_fids:
+        data = feature_embeddings.get(fid)
+        if data is None:
+            continue
+        emb = data["embeddings"]           # [n, d], unit-normed
+        pids = np.array(data["prompt_ids"]) if "prompt_ids" in data else None
+        n = len(emb)
+        if n < 2:
+            continue
+
+        sim_matrix = emb @ emb.T           # cosine sim = dot product (unit-normed)
+
+        # Exclude diagonal; optionally exclude same-prompt pairs
+        include = ~np.eye(n, dtype=bool)
+        if mask_same_context and pids is not None:
+            include &= (pids[:, None] != pids[None, :])
+
+        for s in sim_matrix[include]:
+            records.append({"feature_id": str(fid), "cosine_similarity": float(s)})
+
+    if not records:
+        print("No pairwise similarities to plot.")
+        return
+
+    plot_df = pd.DataFrame(records)
+    ordered_labels = [str(fid) for fid in top_fids if str(fid) in plot_df["feature_id"].values]
+
+    # Baseline: mean random-pair similarity across all features
+    all_emb = np.concatenate([feature_embeddings[fid]["embeddings"] for fid in feature_embeddings])
+    rng = np.random.default_rng(42)
+    idx = rng.choice(len(all_emb), size=(min(1000, len(all_emb)), 2))
+    baseline = float((all_emb[idx[:, 0]] * all_emb[idx[:, 1]]).sum(axis=1).mean())
+
+    fig, ax = plt.subplots(figsize=figsize)
+    sns.violinplot(
+        data=plot_df,
+        x="feature_id", y="cosine_similarity",
+        order=ordered_labels,
+        cut=0,        # don't extend violins beyond the data range
+        inner="box",  # show IQR box inside each violin
+        linewidth=0.8,
+        ax=ax,
+    )
+    ax.axhline(baseline, color="red", linestyle="--", linewidth=1.2, label=f"baseline ({baseline:.3f})")
+    if bottom_n is not None:
+        xlabel = "feature_id  (ordered by specificity_vs_baseline, low → high)"
+        title  = f"Context similarity distributions — bottom {len(ordered_labels)} features"
+    else:
+        xlabel = "feature_id  (ordered by specificity_vs_baseline, high → low)"
+        title  = f"Context similarity distributions — top {len(ordered_labels)} features"
+    ax.set_xlabel(xlabel, fontsize=9)
+    ax.set_ylabel("pairwise cosine similarity", fontsize=9)
+    ax.set_title(title, fontsize=11)
+    ax.tick_params(axis="x", labelsize=7, rotation=45)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    plt.show()
+
 
 def compute_inter_feature_similarity(feature_embeddings: dict) -> tuple[np.ndarray, list]:
     """
