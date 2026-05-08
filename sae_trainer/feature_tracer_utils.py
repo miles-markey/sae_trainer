@@ -156,6 +156,7 @@ class FeatureTracer:
                         "prompt": prompt,
                         "generated_text": text,
                         "token_pos": pos,
+                        "num_tokens": len(tokens),
                         "token": tokens[pos],
                         "feature_id": fid,
                         "activation": val,
@@ -205,7 +206,7 @@ class FeatureTracer:
             return pd.DataFrame(
                 columns=[
                     "prompt_id", "prompt", "generated_text",
-                    "token_pos", "token", "feature_id", "activation"
+                    "token_pos", "num_tokens", "token", "feature_id", "activation"
                 ]
             )
         return pd.DataFrame(self._rows)

@@ -4,6 +4,8 @@ import pandas as pd
 import numpy as np
 import html as html_lib
 from IPython.display import HTML, display as ipy_display
+import plotly.graph_objects as go
+import plotly.express as px
 
 # Optional: UMAP plots (install `umap-learn`, e.g. `uv sync --group full`)
 try:
@@ -200,11 +202,13 @@ def render_feature_card(
     axes[0].set_xlabel("activation")
     axes[0].set_ylabel("count")
 
-    pos_counts = sub["token_pos"].value_counts().sort_index()
-    axes[1].plot(pos_counts.index, pos_counts.values, marker="o", color="#e67e22")
-    axes[1].set_title("Token Position Profile")
-    axes[1].set_xlabel("token_pos")
+    rel_pos = (sub["token_pos"] / sub["num_tokens"]).round(2)
+    rel_pos_counts = rel_pos.value_counts().sort_index()
+    axes[1].plot(rel_pos_counts.index, rel_pos_counts.values, marker="o", color="#e67e22")
+    axes[1].set_title("Relative Token Position Profile")
+    axes[1].set_xlabel("relative position (token_pos / num_tokens)")
     axes[1].set_ylabel("hits")
+    axes[1].set_xlim(0, 1)
 
     fig.suptitle(f"Feature #{feature_id}{scope_label}", fontsize=10, color="#888")
     plt.tight_layout()
@@ -615,16 +619,11 @@ def plot_feature_specificity_scatter(
     figsize             : (width_px, height_px) for the plotly figure
     context_threshold   : x-axis divider for the quadrant lines
     token_threshold     : y-axis divider for the quadrant lines
-    size_by             : "composite_score" (size=composite, color=hits)
-                          or "hits"         (size=hits, color=composite_score)
+    size_by             : "composite_score" (size=composite, color=firing_rate)
+                          or "firing_rate"         (size=firing_rate, color=composite_score)
     """
-    if size_by not in ("composite_score", "hits"):
-        raise ValueError("size_by must be 'composite_score' or 'hits'")
-    try:
-        import plotly.graph_objects as go
-        import plotly.express as px
-    except ImportError:
-        raise ImportError("pip install plotly")
+    if size_by not in ("composite_score", "firing_rate"):
+        raise ValueError("size_by must be 'composite_score' or 'firing_rate'")
 
     scores_df = tracer.get_feature_specificity_scores_df()
     if scores_df is None or scores_df.empty:
@@ -645,11 +644,11 @@ def plot_feature_specificity_scatter(
 
     if size_by == "composite_score":
         marker_sizes = (6 + 18 * _normalize(df["composite_score"])).tolist()
-        marker_color = df["hits"]
+        marker_color = df["firing_rate"]
         colorscale = "Blues"
-        colorbar_title = "hits"
+        colorbar_title = "firing_rate"
     else:
-        marker_sizes = (6 + 18 * _normalize(df["hits"])).tolist()
+        marker_sizes = (6 + 18 * _normalize(df["firing_rate"])).tolist()
         marker_color = df["composite_score"]
         colorscale = "RdYlGn"
         colorbar_title = "composite_score"
@@ -660,7 +659,7 @@ def plot_feature_specificity_scatter(
             f"context_vs_baseline: {row.context_specificity_vs_baseline:.4f}<br>"
             f"token_vs_baseline: {row.token_specificity_vs_baseline:.4f}<br>"
             f"composite_score: {row.composite_score:.4f}<br>"
-            f"hits: {int(row.hits)}<br>"
+            f"firing_rate: {row.firing_rate:.4f}<br>"
             f"mean_activation: {row.mean_activation:.4f}"
         )
         for row in df.itertuples()
@@ -710,10 +709,11 @@ def plot_feature_specificity_scatter(
     ]
 
     n_label = f"top {len(df)}" if top_n is not None else f"all {len(df)}"
+    size_color_label = "size = composite_score · color = firing_rate" if size_by == "composite_score" else "size = firing_rate · color = composite_score"
     layout = go.Layout(
         title=dict(
             text=f"Feature specificity landscape ({n_label} features)<br>"
-                 "<sup>size = hits · color = composite_score</sup>",
+                 f"<sup>{size_color_label}</sup>",
             font=dict(size=14),
         ),
         xaxis=dict(title="context_specificity_vs_baseline", zeroline=False, range=xl),
