@@ -20,6 +20,8 @@ class TraceConfig:
     # "generated_only" — exclude prompt tokens (default, previous behaviour)
     # "prompt_only"    — exclude generated tokens
     token_mode: Literal["all", "generated_only", "prompt_only"] = "generated_only"
+    min_prompts: int = 10,   # minimum distinct prompts a feature must appear in to be scored
+
 
 
 class FeatureTracer:
@@ -306,7 +308,7 @@ class FeatureTracer:
     def compute_feature_embeddings(
         self,
         feature_ids: Optional[List[int]] = None,
-        contexts_per_feature: int = 50,
+        contexts_per_feature: Optional[int] = None,
         model_name: str = "all-MiniLM-L6-v2",
         batch_size: int = 64,
     ) -> Dict[int, Dict]:
@@ -377,11 +379,10 @@ class FeatureTracer:
         self,
         #feature_embeddings: Optional[Dict] = None,
         feature_ids: Optional[List[int]] = None,
-        contexts_per_feature: int = 50,
+        contexts_per_feature: Optional[int] = None,
         model_name: str = "all-MiniLM-L6-v2",
         weighted: bool = True,
         mask_same_context: bool = True,
-        min_prompts: int = 5,   # minimum distinct prompts a feature must appear in to be scored
     ) -> pd.DataFrame:
         """
         Compute a specificity score for each feature as the mean pairwise cosine
@@ -432,7 +433,7 @@ class FeatureTracer:
 
             pids = np.array(data["prompt_ids"]) if "prompt_ids" in data else None
             n_distinct_prompts = len(set(pids)) if pids is not None else n
-            if n_distinct_prompts < min_prompts:
+            if n_distinct_prompts < self.cfg.min_prompts:
                 continue
 
             weights = acts / (acts.sum() + 1e-8) if weighted else np.ones(n) / n
@@ -483,7 +484,21 @@ class FeatureTracer:
 
         result_df["context_specificity_vs_baseline"] = result_df["context_specificity"] - context_baseline
         result_df["token_specificity_vs_baseline"] = result_df["token_specificity"] - token_baseline
-        result_df["composite_score"] = result_df["context_specificity_vs_baseline"] * result_df["mean_activation"]
+
+        # Firing rate: fraction of all traced token positions where the feature was active
+        total_token_positions = self.to_dataframe()[["prompt_id", "token_pos"]].drop_duplicates().shape[0]
+        result_df["firing_rate"] = result_df["hits"] / max(total_token_positions, 1)
+
+        # Shift both axes so the minimum value across all features maps to 0,
+        # then take the harmonic mean scaled by firing rate.
+        # This preserves relative differences without hard-clipping below-baseline
+        # features to the same value.
+        c = result_df["context_specificity_vs_baseline"]
+        t = result_df["token_specificity_vs_baseline"]
+        c_scaled = c - c.min()
+        t_scaled = t - t.min()
+        result_df["composite_score"] = (2 * c_scaled * t_scaled / (c_scaled + t_scaled + 1e-8)) * result_df["mean_activation"]
+
         result_df = result_df.sort_values("context_specificity_vs_baseline", ascending=False).reset_index(drop=True)
         
         self._feature_specificity_scores_df = result_df

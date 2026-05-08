@@ -590,29 +590,42 @@ def plot_inter_feature_similarity(
 def plot_feature_specificity_scatter(
     tracer: FeatureTracer,
     top_n: int | None = None,
-    figsize: tuple = (9, 7),
-    annotate_n: int = 10,
+    figsize: tuple = (900, 700),
+    context_threshold: float = 0.025,
+    token_threshold: float = 0.04,
+    size_by: str = "composite_score",
 ):
     """
-    Scatterplot with context_specificity_vs_baseline on the x-axis and
+    Interactive scatterplot with context_specificity_vs_baseline on the x-axis and
     token_specificity_vs_baseline on the y-axis.
 
-    Each point is one feature.  Dashed lines at x=0 / y=0 divide the plot
-    into four interpretable quadrants:
+    Hover over any point to see its feature_id, both specificity scores, composite
+    score, hit count, and mean activation.
+
+    Dashed lines at context_threshold / token_threshold divide the plot into four quadrants:
 
         High context + High token  → concept-specific features
         Low  context + High token  → token-specific, context-agnostic (e.g. "the")
         High context + Low  token  → context-specific, token-diverse
         Low  context + Low  token  → noisy or near-dead
 
-    Point size  = hit count (larger = fires more often)
-    Point color = composite_score (green = genuinely active + specific)
-
     Parameters
     ----------
-    top_n : restrict to the top-N features by composite_score (None = all features)
-    annotate_n : label the top-N features by composite_score with their feature_id
+    top_n               : restrict to the top-N features by composite_score (None = all features)
+    figsize             : (width_px, height_px) for the plotly figure
+    context_threshold   : x-axis divider for the quadrant lines
+    token_threshold     : y-axis divider for the quadrant lines
+    size_by             : "composite_score" (size=composite, color=hits)
+                          or "hits"         (size=hits, color=composite_score)
     """
+    if size_by not in ("composite_score", "hits"):
+        raise ValueError("size_by must be 'composite_score' or 'hits'")
+    try:
+        import plotly.graph_objects as go
+        import plotly.express as px
+    except ImportError:
+        raise ImportError("pip install plotly")
+
     scores_df = tracer.get_feature_specificity_scores_df()
     if scores_df is None or scores_df.empty:
         print("No specificity scores available. Run tracer.feature_specificity_scores() first.")
@@ -626,54 +639,95 @@ def plot_feature_specificity_scatter(
     if top_n is not None:
         df = df.nlargest(top_n, "composite_score")
 
-    x = df["context_specificity_vs_baseline"].values
-    y = df["token_specificity_vs_baseline"].values
-    sizes = 30 + 200 * (df["hits"].values / df["hits"].values.max())
-    colors = df["composite_score"].values
+    def _normalize(series):
+        lo, hi = series.min(), series.max()
+        return (series - lo) / (hi - lo + 1e-8)
 
-    fig, ax = plt.subplots(figsize=figsize)
+    if size_by == "composite_score":
+        marker_sizes = (6 + 18 * _normalize(df["composite_score"])).tolist()
+        marker_color = df["hits"]
+        colorscale = "Blues"
+        colorbar_title = "hits"
+    else:
+        marker_sizes = (6 + 18 * _normalize(df["hits"])).tolist()
+        marker_color = df["composite_score"]
+        colorscale = "RdYlGn"
+        colorbar_title = "composite_score"
 
-    sc = ax.scatter(
-        x, y,
-        s=sizes,
-        c=colors,
-        cmap="RdYlGn",
-        alpha=0.85,
-        linewidths=0.4,
-        edgecolors="grey",
+    hover_text = [
+        (
+            f"<b>feature {int(row.feature_id)}</b><br>"
+            f"context_vs_baseline: {row.context_specificity_vs_baseline:.4f}<br>"
+            f"token_vs_baseline: {row.token_specificity_vs_baseline:.4f}<br>"
+            f"composite_score: {row.composite_score:.4f}<br>"
+            f"hits: {int(row.hits)}<br>"
+            f"mean_activation: {row.mean_activation:.4f}"
+        )
+        for row in df.itertuples()
+    ]
+
+    scatter = go.Scatter(
+        x=df["context_specificity_vs_baseline"],
+        y=df["token_specificity_vs_baseline"],
+        mode="markers",
+        marker=dict(
+            size=marker_sizes,
+            color=marker_color,
+            colorscale=colorscale,
+            colorbar=dict(title=colorbar_title),
+            line=dict(width=0.5, color="grey"),
+            opacity=0.85,
+        ),
+        text=hover_text,
+        hoverinfo="text",
+        showlegend=False,
     )
-    fig.colorbar(sc, ax=ax, label="composite_score")
 
-    # Quadrant dividers
-    ax.axvline(0, color="#888", linestyle="--", linewidth=0.9, zorder=0)
-    ax.axhline(0, color="#888", linestyle="--", linewidth=0.9, zorder=0)
+    x_range = [df["context_specificity_vs_baseline"].min(), df["context_specificity_vs_baseline"].max()]
+    y_range = [df["token_specificity_vs_baseline"].min(), df["token_specificity_vs_baseline"].max()]
+    x_pad = (x_range[1] - x_range[0]) * 0.08
+    y_pad = (y_range[1] - y_range[0]) * 0.08
+    xl = [x_range[0] - x_pad, x_range[1] + x_pad]
+    yl = [y_range[0] - y_pad, y_range[1] + y_pad]
 
-    # Quadrant labels
-    xmin, xmax = ax.get_xlim()
-    ymin, ymax = ax.get_ylim()
-    pad = 0.03
-    quad_kw = dict(fontsize=7.5, color="#555", ha="center", va="center", style="italic")
-    ax.text(xmin + (0 - xmin) * 0.5, ymax - (ymax - 0) * pad * 2, "context-specific\ntoken-diverse",  **quad_kw)
-    ax.text(xmax - (xmax - 0) * 0.5, ymax - (ymax - 0) * pad * 2, "concept-specific",               **quad_kw)
-    ax.text(xmin + (0 - xmin) * 0.5, ymin + (0 - ymin) * pad * 2, "noisy / near-dead",              **quad_kw)
-    ax.text(xmax - (xmax - 0) * 0.5, ymin + (0 - ymin) * pad * 2, "token-specific\ncontext-agnostic", **quad_kw)
+    cx = context_threshold
+    ty = token_threshold
+    quadrant_labels = [
+        dict(x=(xl[0] + cx) / 2, y=(ty + yl[1]) / 2, text="context-specific<br>token-diverse"),
+        dict(x=(cx + xl[1]) / 2, y=(ty + yl[1]) / 2, text="concept-specific"),
+        dict(x=(xl[0] + cx) / 2, y=(yl[0] + ty) / 2, text="noisy / near-dead"),
+        dict(x=(cx + xl[1]) / 2, y=(yl[0] + ty) / 2, text="token-specific<br>context-agnostic"),
+    ]
+    annotations = [
+        dict(
+            x=q["x"], y=q["y"],
+            text=q["text"],
+            showarrow=False,
+            font=dict(size=10, color="#888"),
+            xref="x", yref="y",
+        )
+        for q in quadrant_labels
+    ]
 
-    # Annotate top features by composite_score
-    if annotate_n and annotate_n > 0:
-        top_rows = df.nlargest(annotate_n, "composite_score")
-        for _, row in top_rows.iterrows():
-            ax.annotate(
-                str(int(row["feature_id"])),
-                (row["context_specificity_vs_baseline"], row["token_specificity_vs_baseline"]),
-                fontsize=6.5,
-                xytext=(4, 4),
-                textcoords="offset points",
-                color="#222",
-            )
-
-    ax.set_xlabel("context_specificity_vs_baseline", fontsize=10)
-    ax.set_ylabel("token_specificity_vs_baseline", fontsize=10)
     n_label = f"top {len(df)}" if top_n is not None else f"all {len(df)}"
-    ax.set_title(f"Feature specificity landscape ({n_label} features)\nsize = hits, color = composite_score", fontsize=11)
-    fig.tight_layout()
-    plt.show()
+    layout = go.Layout(
+        title=dict(
+            text=f"Feature specificity landscape ({n_label} features)<br>"
+                 "<sup>size = hits · color = composite_score</sup>",
+            font=dict(size=14),
+        ),
+        xaxis=dict(title="context_specificity_vs_baseline", zeroline=False, range=xl),
+        yaxis=dict(title="token_specificity_vs_baseline", zeroline=False, range=yl),
+        width=figsize[0],
+        height=figsize[1],
+        hovermode="closest",
+        annotations=annotations,
+        shapes=[
+            dict(type="line", x0=cx, x1=cx, y0=yl[0], y1=yl[1],
+                 line=dict(color="#aaa", dash="dash", width=1.2)),
+            dict(type="line", x0=xl[0], x1=xl[1], y0=ty, y1=ty,
+                 line=dict(color="#aaa", dash="dash", width=1.2)),
+        ],
+    )
+
+    go.Figure(data=[scatter], layout=layout).show()

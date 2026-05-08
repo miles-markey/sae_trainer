@@ -34,6 +34,7 @@ subset = [
     "python-dotenv==1.0.1",
     "pyyaml>=6.0",
     "wandb>=0.17",
+    "plotly>=5.0",
 ]
 # subset + optional UMAP (feature / latent plots)
 full = [
