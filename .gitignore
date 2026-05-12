@@ -10,4 +10,5 @@ wandb/
 configs/
 !configs/gpt2_baseline.yaml
 !configs/qwen05_baseline.yaml
+!model_weights_files/topk_sae_qwen_openwebtext_layer12.pt
 notebooks/playground.ipynb
