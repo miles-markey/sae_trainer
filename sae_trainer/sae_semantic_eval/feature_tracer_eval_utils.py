@@ -214,6 +214,419 @@ def render_feature_card(
     plt.tight_layout()
     plt.show()
 
+def render_feature_card_comparison(
+    feature_id: int,
+    prompt_tracer: FeatureTracer,
+    response_tracer: FeatureTracer,
+    top_n: int = 8,
+    window: int = 8,
+):
+    """
+    Side-by-side feature card comparing how a feature behaves in prompt_tracer vs response_tracer.
+
+    Shows per-tracer stats, top activating contexts, activation distributions, and
+    relative token position profiles. If compute_feature_embeddings() has been called on
+    both tracers, also shows the cosine similarity between the mean context embeddings.
+    """
+
+    def _extract_sub(tracer):
+        df = tracer.to_dataframe()
+        sub = df[df["feature_id"] == feature_id].copy()
+        return sub if not sub.empty else None
+
+    def _extract_contexts(sub, tracer):
+        top_rows = (
+            sub.sort_values("activation", ascending=False)
+            .drop_duplicates(subset="prompt_id", keep="first")
+            .head(top_n)
+        )
+        contexts = []
+        for _, r in top_rows.iterrows():
+            ids = tracer.tokenizer(r["generated_text"], return_tensors="pt")["input_ids"][0]
+            toks = tracer.tokenizer.convert_ids_to_tokens(ids)
+            pos = int(r["token_pos"])
+            lo, hi = max(0, pos - window), min(len(toks), pos + window + 1)
+            contexts.append({
+                "token_pos": pos,
+                "activation": r["activation"],
+                "pre":  tracer.tokenizer.convert_tokens_to_string(toks[lo:pos]),
+                "mid":  tracer.tokenizer.convert_tokens_to_string([toks[pos]]) if pos < len(toks) else "",
+                "post": tracer.tokenizer.convert_tokens_to_string(toks[pos + 1:hi]),
+            })
+        return contexts
+
+    def _column_html(label, color, sub, contexts):
+        if sub is None:
+            return f"""
+            <div style="flex:1;padding:0 12px;">
+              <h4 style="margin:0 0 8px 0;color:{color};">{label}</h4>
+              <p style="color:#aaa;font-size:0.85em;">Feature not found in this tracer.</p>
+            </div>"""
+
+        hits = len(sub)
+        mean_act = sub["activation"].mean()
+        max_act = sub["activation"].max()
+        min_act = sub["activation"].min()
+
+        ctx_html = ""
+        for ctx in contexts:
+            act = ctx["activation"]
+            opacity = 0.15 + 0.75 * (act - min_act) / (max_act - min_act + 1e-8)
+            pre  = html_lib.escape(ctx["pre"])
+            mid  = html_lib.escape(ctx["mid"])
+            post = html_lib.escape(ctx["post"])
+            ctx_html += f"""
+            <div style="margin:4px 0;padding:5px 8px;background:white;
+                        border-left:4px solid rgba(220,50,50,{opacity:.2f});
+                        border-radius:0 4px 4px 0;font-size:0.82em;line-height:1.5;">
+              <span style="color:#999;font-size:0.78em;">[pos={ctx['token_pos']}, act={act:.3f}]</span>
+              <span style="margin-left:6px;">...{pre}<span style="background:rgba(220,50,50,{opacity:.2f});
+                font-weight:bold;padding:1px 3px;border-radius:2px;">{mid}</span>{post}...</span>
+            </div>"""
+
+        return f"""
+        <div style="flex:1;padding:0 12px;min-width:0;">
+          <h4 style="margin:0 0 6px 0;color:{color};">{label}</h4>
+          <div style="display:flex;gap:16px;margin-bottom:8px;font-size:0.85em;color:#555;">
+            <span><b>Hits:</b> {hits}</span>
+            <span><b>Mean act:</b> {mean_act:.3f}</span>
+            <span><b>Max act:</b> {max_act:.3f}</span>
+            <span><b>Prompts:</b> {sub['prompt_id'].nunique()}</span>
+          </div>
+          <div style="font-size:0.82em;font-weight:bold;margin-bottom:4px;color:#444;">
+            Top Activating Contexts
+          </div>
+          {ctx_html}
+        </div>"""
+
+    p_sub = _extract_sub(prompt_tracer)
+    r_sub = _extract_sub(response_tracer)
+    p_ctx = _extract_contexts(p_sub, prompt_tracer) if p_sub is not None else []
+    r_ctx = _extract_contexts(r_sub, response_tracer) if r_sub is not None else []
+
+    # Embedding similarity (if available)
+    emb_sim_html = ""
+    p_embs = prompt_tracer.get_feature_embeddings()
+    r_embs = response_tracer.get_feature_embeddings()
+    if p_embs and r_embs and feature_id in p_embs and feature_id in r_embs:
+        p_mean = p_embs[feature_id]["context_embeddings"].mean(axis=0)
+        p_mean /= np.linalg.norm(p_mean) + 1e-8
+        r_mean = r_embs[feature_id]["context_embeddings"].mean(axis=0)
+        r_mean /= np.linalg.norm(r_mean) + 1e-8
+        sim = float(p_mean @ r_mean)
+        sim_color = "#27ae60" if sim >= 0.7 else "#e67e22" if sim >= 0.4 else "#c0392b"
+        emb_sim_html = (
+            f'<span style="font-size:0.85em;color:{sim_color};margin-left:16px;">'
+            f'embedding similarity: <b>{sim:.3f}</b></span>'
+        )
+
+    html = f"""
+    <div style="border:2px solid #999;border-radius:8px;padding:16px;margin:12px 0;
+                font-family:monospace;background:#f8f9fa;max-width:1200px;">
+      <div style="display:flex;align-items:baseline;margin-bottom:12px;">
+        <h3 style="margin:0;color:#1a1a2e;">Feature #{feature_id}</h3>
+        {emb_sim_html}
+      </div>
+      <hr style="margin:0 0 12px 0;border-color:#ddd;">
+      <div style="display:flex;gap:0;">
+        {_column_html("Prompt mode", "#4a90d9", p_sub, p_ctx)}
+        <div style="width:1px;background:#ddd;flex-shrink:0;"></div>
+        {_column_html("Response mode", "#e67e22", r_sub, r_ctx)}
+      </div>
+    </div>"""
+    ipy_display(HTML(html))
+
+    # --- Side-by-side plots ---
+    has_p = p_sub is not None
+    has_r = r_sub is not None
+    if not has_p and not has_r:
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 4))
+
+    def _fill_col(ax_dist, ax_pos, sub, color, label):
+        if sub is None:
+            ax_dist.text(0.5, 0.5, "not found", ha="center", va="center",
+                         transform=ax_dist.transAxes, color="#aaa")
+            ax_pos.text(0.5, 0.5, "not found", ha="center", va="center",
+                        transform=ax_pos.transAxes, color="#aaa")
+            return
+        ax_dist.hist(sub["activation"], bins=20, color=color, edgecolor="white")
+        ax_dist.set_title(f"{label} — Activation Distribution", fontsize=9)
+        ax_dist.set_xlabel("activation")
+        ax_dist.set_ylabel("count")
+
+        rel_pos = (sub["token_pos_relative"] / sub["num_tokens_relative"]).round(2)
+        counts = rel_pos.value_counts().sort_index()
+        ax_pos.plot(counts.index, counts.values, marker="o", color=color)
+        ax_pos.set_title(f"{label} — Relative Token Position", fontsize=9)
+        ax_pos.set_xlabel("relative position")
+        ax_pos.set_ylabel("hits")
+        ax_pos.set_xlim(0, 1)
+
+    _fill_col(axes[0, 0], axes[1, 0], p_sub, "#4a90d9", "Prompt")
+    _fill_col(axes[0, 1], axes[1, 1], r_sub, "#e67e22", "Response")
+
+    fig.suptitle(f"Feature #{feature_id}", fontsize=10, color="#888")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_prompt_response_activation_scatter(
+    feature_id: int,
+    prompt_tracer: FeatureTracer,
+    response_tracer: FeatureTracer,
+    figsize: tuple = (750, 700),
+):
+    """
+    Per-prompt scatter showing whether a feature's activation is preserved from
+    prompt tokens to response tokens.
+
+    Each point is one prompt (matched by prompt_id). Points are only included if
+    both tracers processed the same prompt — unmatched prompt_ids are dropped.
+
+      x-axis = mean activation over prompt tokens (0 if feature didn't fire)
+      y-axis = mean activation over response tokens (0 if feature didn't fire)
+
+    Point color encodes firing category:
+      both          (green)  : feature fired in both prompt and response portions
+      prompt-only   (blue)   : feature fired in prompt but not response
+      response-only (orange) : feature fired in response but not prompt
+
+    Prompts where the feature didn't fire in either portion are excluded.
+    A diagonal reference line (y = x) marks perfect activation preservation.
+    """
+    p_df = prompt_tracer.to_dataframe()
+    r_df = response_tracer.to_dataframe()
+
+    # Mean activation per prompt for this feature (only prompts where it fired)
+    p_feat = (
+        p_df[p_df["feature_id"] == feature_id]
+        .groupby("prompt_id")["activation"].mean()
+    )
+    r_feat = (
+        r_df[r_df["feature_id"] == feature_id]
+        .groupby("prompt_id")["activation"].mean()
+    )
+
+    # Only compare prompts that both tracers processed
+    shared_pids = sorted(
+        set(p_df["prompt_id"].unique()) & set(r_df["prompt_id"].unique())
+    )
+    if not shared_pids:
+        print("No shared prompt_ids between the two tracers.")
+        return
+
+    p_feat = p_feat.reindex(shared_pids, fill_value=0.0)
+    r_feat = r_feat.reindex(shared_pids, fill_value=0.0)
+
+    combined = pd.DataFrame({
+        "prompt_id":          shared_pids,
+        "prompt_activation":  p_feat.values,
+        "response_activation": r_feat.values,
+    })
+
+    # Drop prompts where the feature didn't fire in either portion
+    combined = combined[(combined["prompt_activation"] > 0) | (combined["response_activation"] > 0)]
+    if combined.empty:
+        print(f"Feature {feature_id} did not fire in any shared prompt.")
+        return
+
+    def _category(row):
+        if row.prompt_activation > 0 and row.response_activation > 0:
+            return "both"
+        elif row.prompt_activation > 0:
+            return "prompt-only"
+        return "response-only"
+
+    combined["category"] = [_category(r) for r in combined.itertuples()]
+
+    color_map  = {"both": "#27ae60", "prompt-only": "#4a90d9", "response-only": "#e67e22"}
+    traces = []
+    for cat, grp in combined.groupby("category"):
+        hover = [
+            f"<b>prompt {row.prompt_id}</b><br>"
+            f"prompt_activation: {row.prompt_activation:.4f}<br>"
+            f"response_activation: {row.response_activation:.4f}"
+            for row in grp.itertuples()
+        ]
+        traces.append(go.Scatter(
+            x=grp["prompt_activation"],
+            y=grp["response_activation"],
+            mode="markers",
+            name=cat,
+            marker=dict(color=color_map[cat], size=9, opacity=0.85,
+                        line=dict(width=0.5, color="grey")),
+            text=hover,
+            hoverinfo="text",
+        ))
+
+    # Diagonal reference line (y = x)
+    ax_max = max(combined["prompt_activation"].max(), combined["response_activation"].max()) * 1.05
+    diag = go.Scatter(
+        x=[0, ax_max], y=[0, ax_max],
+        mode="lines",
+        name="y = x (perfect preservation)",
+        line=dict(color="#aaa", dash="dash", width=1.2),
+        hoverinfo="skip",
+    )
+    traces.append(diag)
+
+    # Correlation across prompts where both fired
+    both = combined[combined["category"] == "both"]
+    corr_str = ""
+    if len(both) >= 2:
+        corr = float(np.corrcoef(both["prompt_activation"], both["response_activation"])[0, 1])
+        corr_str = f" · r={corr:.3f} (prompts where both fired)"
+
+    n_both     = (combined["category"] == "both").sum()
+    n_p_only   = (combined["category"] == "prompt-only").sum()
+    n_r_only   = (combined["category"] == "response-only").sum()
+
+    layout = go.Layout(
+        title=dict(
+            text=(
+                f"Feature #{feature_id} — prompt vs. response activation per prompt<br>"
+                f"<sup>both: {n_both} · prompt-only: {n_p_only} · response-only: {n_r_only}"
+                f"{corr_str}</sup>"
+            ),
+            font=dict(size=13),
+        ),
+        xaxis=dict(title="mean activation — prompt tokens", rangemode="tozero"),
+        yaxis=dict(title="mean activation — response tokens", rangemode="tozero"),
+        width=figsize[0],
+        height=figsize[1],
+        hovermode="closest",
+        legend=dict(title="category"),
+    )
+
+    go.Figure(data=traces, layout=layout).show()
+
+
+def render_prompt_response_token_card(
+    feature_id: int,
+    prompt_id: int,
+    prompt_tracer: FeatureTracer,
+    response_tracer: FeatureTracer,
+):
+    """
+    Renders the full token sequence of a single prompt, highlighting where a given
+    feature fired in the prompt portion (blue region) vs the response portion (orange region).
+
+    Token background encodes region (prompt=blue, response=orange). Tokens where the
+    feature fired are highlighted in red with intensity proportional to activation strength;
+    hovering over a token shows its position and activation value.
+
+    Requires both tracers to have been run on the same prompt_id.
+    Uses token_pos_relative and num_tokens_relative stored in _rows to recover the
+    prompt/response boundary without re-tokenizing.
+    """
+    prompt_id = str(prompt_id)
+    
+    tokenizer = prompt_tracer.tokenizer
+
+    p_df = prompt_tracer.to_dataframe()
+    r_df = response_tracer.to_dataframe()
+
+    p_pid = p_df[p_df["prompt_id"] == prompt_id]
+    r_pid = r_df[r_df["prompt_id"] == prompt_id]
+
+    if p_pid.empty and r_pid.empty:
+        print(f"prompt_id {prompt_id} not found in either tracer.")
+        return
+
+    # Recover prompt/response boundary from stored relative position fields
+    if not r_pid.empty:
+        row0 = r_pid.iloc[0]
+        num_prompt_tokens = int(row0["token_pos"] - row0["token_pos_relative"])
+    else:
+        row0 = p_pid.iloc[0]
+        num_prompt_tokens = int(row0["num_tokens_relative"])
+
+    generated_text = row0["generated_text"]
+    token_ids = tokenizer(generated_text, return_tensors="pt")["input_ids"][0]
+    tokens = tokenizer.convert_ids_to_tokens(token_ids.tolist())
+
+    # Activation lookup for this feature at each token position
+    p_acts = (
+        p_pid[p_pid["feature_id"] == feature_id]
+        .set_index("token_pos")["activation"]
+        .to_dict()
+    )
+    r_acts = (
+        r_pid[r_pid["feature_id"] == feature_id]
+        .set_index("token_pos")["activation"]
+        .to_dict()
+    )
+    all_acts = {**p_acts, **r_acts}
+    max_act = max(all_acts.values()) if all_acts else 1.0
+
+    # Per-region stats
+    p_hits, r_hits = len(p_acts), len(r_acts)
+    p_mean = float(np.mean(list(p_acts.values()))) if p_acts else 0.0
+    r_mean = float(np.mean(list(r_acts.values()))) if r_acts else 0.0
+
+    # Build token spans
+    spans = []
+    for pos, tok in enumerate(tokens):
+        tok_str = html_lib.escape(tokenizer.convert_tokens_to_string([tok]))
+        is_prompt = pos < num_prompt_tokens
+        region_bg = "#ddeeff" if is_prompt else "#ffeedd"
+
+        act = all_acts.get(pos, 0.0)
+        if act > 0:
+            intensity = act / max_act
+            alpha = 0.2 + 0.7 * intensity
+            weight = "bold" if intensity > 0.5 else "normal"
+            spans.append(
+                f'<span title="pos={pos}, act={act:.3f}" '
+                f'style="background:rgba(220,50,50,{alpha:.2f});font-weight:{weight};'
+                f'border-radius:3px;padding:1px 2px;cursor:default;">{tok_str}</span>'
+            )
+        else:
+            spans.append(
+                f'<span style="background:{region_bg};border-radius:2px;'
+                f'padding:1px 2px;">{tok_str}</span>'
+            )
+
+    # Inject [RESPONSE] boundary marker
+    spans.insert(
+        num_prompt_tokens,
+        '<span style="display:inline-block;margin:0 5px;padding:1px 7px;'
+        'background:#ccc;border-radius:4px;font-size:0.72em;color:#444;'
+        'vertical-align:middle;">[RESPONSE]</span>',
+    )
+
+    html = f"""
+    <div style="border:2px solid #999;border-radius:8px;padding:16px;margin:12px 0;
+                font-family:monospace;background:#f8f9fa;max-width:1100px;">
+      <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:10px;">
+        <h3 style="margin:0;color:#1a1a2e;">Feature #{feature_id}</h3>
+        <span style="font-size:0.8em;color:#888;">prompt {prompt_id}</span>
+      </div>
+      <div style="display:flex;gap:16px;margin-bottom:12px;font-size:0.85em;">
+        <div style="background:#ddeeff;border-radius:6px;padding:7px 14px;color:#555;">
+          <b style="color:#4a90d9;">Prompt portion</b>&nbsp;&nbsp;
+          hits: {p_hits} &nbsp;·&nbsp; mean act: {p_mean:.3f}
+        </div>
+        <div style="background:#ffeedd;border-radius:6px;padding:7px 14px;color:#555;">
+          <b style="color:#e67e22;">Response portion</b>&nbsp;&nbsp;
+          hits: {r_hits} &nbsp;·&nbsp; mean act: {r_mean:.3f}
+        </div>
+        <div style="background:rgba(220,50,50,0.15);border-radius:6px;padding:7px 14px;color:#555;">
+          <b style="color:#c0392b;">&#9632; highlighted</b>&nbsp;&nbsp;
+          feature activation (hover for value)
+        </div>
+      </div>
+      <hr style="margin:0 0 12px 0;border-color:#ddd;">
+      <div style="line-height:2.2;font-size:0.88em;word-wrap:break-word;">
+        {"".join(spans)}
+      </div>
+    </div>"""
+
+    ipy_display(HTML(html))
+
+
 def plot_feature_umap(
     tracer,
     top_n: int = 20,           # restrict to top-N features by specificity to keep plot readable
@@ -731,3 +1144,143 @@ def plot_feature_specificity_scatter(
     )
 
     go.Figure(data=[scatter], layout=layout).show()
+
+
+def plot_prompt_vs_response_features(
+    prompt_tracer: FeatureTracer,
+    response_tracer: FeatureTracer,
+    min_hits: int = 5,
+    min_context_specificity_vs_baseline: float | None = None,
+    max_token_specificity_vs_baseline: float | None = None,
+    figsize: tuple = (900, 750),
+):
+    """
+    Compare features that appear in both a prompt-mode tracer and a response-mode tracer.
+
+    Only shared features are plotted (those that fired in both tracers):
+      x-axis = hit count in prompt_tracer
+      y-axis = hit count in response_tracer
+      color  = cosine similarity between mean context embeddings across the two tracers
+               (green = same semantic context in both modes, red = different)
+
+    Specificity filters (applied per-tracer, feature excluded if it fails in either):
+      min_context_specificity_vs_baseline : exclude features below this context specificity
+      max_token_specificity_vs_baseline   : exclude features above this token specificity
+                                            (useful for removing token-specific features
+                                            that aren't capturing context)
+
+    Requires compute_feature_embeddings() on both tracers.
+    Filters require feature_specificity_scores() on both tracers.
+    """
+    prompt_embs = prompt_tracer.get_feature_embeddings()
+    response_embs = response_tracer.get_feature_embeddings()
+
+    if prompt_embs is None or response_embs is None:
+        print("Call compute_feature_embeddings() on both tracers first.")
+        return
+
+    # Build specificity lookup tables (None if scores not yet computed)
+    def _scores_lookup(tracer, col):
+        try:
+            return tracer.get_feature_specificity_scores_df().set_index("feature_id")[col].to_dict()
+        except RuntimeError:
+            return None
+
+    p_ctx  = _scores_lookup(prompt_tracer,   "context_specificity_vs_baseline")
+    r_ctx  = _scores_lookup(response_tracer, "context_specificity_vs_baseline")
+    p_tok  = _scores_lookup(prompt_tracer,   "token_specificity_vs_baseline")
+    r_tok  = _scores_lookup(response_tracer, "token_specificity_vs_baseline")
+
+    shared_fids = set(prompt_embs.keys()) & set(response_embs.keys())
+
+    rows = []
+    for fid in shared_fids:
+        p_hits = len(prompt_embs[fid]["activations"])
+        r_hits = len(response_embs[fid]["activations"])
+
+        if max(p_hits, r_hits) < min_hits:
+            continue
+
+        # Specificity filters — skip if either tracer fails the threshold
+        if min_context_specificity_vs_baseline is not None and p_ctx and r_ctx:
+            if p_ctx.get(fid, -np.inf) < min_context_specificity_vs_baseline:
+                continue
+            if r_ctx.get(fid, -np.inf) < min_context_specificity_vs_baseline:
+                continue
+
+        if max_token_specificity_vs_baseline is not None and p_tok and r_tok:
+            if p_tok.get(fid, np.inf) > max_token_specificity_vs_baseline:
+                continue
+            if r_tok.get(fid, np.inf) > max_token_specificity_vs_baseline:
+                continue
+
+        p_mean = prompt_embs[fid]["context_embeddings"].mean(axis=0)
+        p_mean /= np.linalg.norm(p_mean) + 1e-8
+        r_mean = response_embs[fid]["context_embeddings"].mean(axis=0)
+        r_mean /= np.linalg.norm(r_mean) + 1e-8
+        emb_sim = float(p_mean @ r_mean)
+
+        rows.append({
+            "feature_id": fid,
+            "prompt_hits": p_hits,
+            "response_hits": r_hits,
+            "emb_sim": emb_sim,
+        })
+
+    if not rows:
+        print(f"No shared features passed all filters (min_hits={min_hits}).")
+        return
+
+    df = pd.DataFrame(rows)
+
+    hover_text = [
+        (
+            f"<b>feature {int(r.feature_id)}</b><br>"
+            f"prompt_hits: {int(r.prompt_hits)}<br>"
+            f"response_hits: {int(r.response_hits)}<br>"
+            f"embedding_sim: {r.emb_sim:.4f}"
+        )
+        for r in df.itertuples()
+    ]
+
+    filter_parts = []
+    if min_context_specificity_vs_baseline is not None:
+        filter_parts.append(f"min_context_spec={min_context_specificity_vs_baseline}")
+    if max_token_specificity_vs_baseline is not None:
+        filter_parts.append(f"max_token_spec={max_token_specificity_vs_baseline}")
+    filter_str = " · ".join(filter_parts) + " · " if filter_parts else ""
+
+    layout = go.Layout(
+        title=dict(
+            text=(
+                f"Prompt vs. response feature comparison — {len(df)} shared features<br>"
+                f"<sup>{filter_str}min_hits={min_hits}</sup>"
+            ),
+            font=dict(size=14),
+        ),
+        xaxis=dict(title="prompt_tracer hits"),
+        yaxis=dict(title="response_tracer hits"),
+        width=figsize[0],
+        height=figsize[1],
+        hovermode="closest",
+    )
+
+    go.Figure(
+        data=[go.Scatter(
+            x=df["prompt_hits"], y=df["response_hits"],
+            mode="markers",
+            marker=dict(
+                color=df["emb_sim"],
+                colorscale="RdYlGn",
+                cmin=-1, cmax=1,
+                colorbar=dict(title="embedding<br>similarity", x=1.02),
+                size=10,
+                opacity=0.85,
+                line=dict(width=0.5, color="grey"),
+            ),
+            text=hover_text,
+            hoverinfo="text",
+            showlegend=False,
+        )],
+        layout=layout,
+    ).show()
