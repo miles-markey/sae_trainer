@@ -3,6 +3,7 @@ from typing import List, Dict, Optional, Literal
 import torch
 import pandas as pd
 import numpy as np
+from ..core.model_utils import SparseAutoencoder
 
 
 @dataclass
@@ -20,7 +21,7 @@ class TraceConfig:
     # "generated_only" — exclude prompt tokens (default, previous behaviour)
     # "prompt_only"    — exclude generated tokens
     token_mode: Literal["all", "generated_only", "prompt_only"] = "generated_only"
-    min_prompts: int = 10,   # minimum distinct prompts a feature must appear in to be scored
+    min_prompts: int = 10   # minimum distinct prompts a feature must appear in to be scored
 
 
 
@@ -34,7 +35,7 @@ class FeatureTracer:
       - SAE input dim matches hooked layer hidden dim
     """
 
-    def __init__(self, llm, tokenizer, sae, device: str, config: TraceConfig):
+    def __init__(self, llm, tokenizer, sae: SparseAutoencoder, device: str, config: TraceConfig):
         self.llm = llm
         self.tokenizer = tokenizer
         self.sae = sae
@@ -150,13 +151,24 @@ class FeatureTracer:
                 if val <= self.cfg.min_activation:
                     continue
                 fid = int(top_idx[pos, j])
+                if self.cfg.token_mode == 'all':
+                    token_pos_relative = pos
+                    num_tokens_relative = len(tokens)
+                elif self.cfg.token_mode == 'generated_only':
+                    token_pos_relative = pos - num_prompt_tokens
+                    num_tokens_relative = len(tokens) - num_prompt_tokens
+                elif self.cfg.token_mode == 'prompt_only':
+                    token_pos_relative = pos
+                    num_tokens_relative = num_prompt_tokens
                 self._rows.append(
                     {
                         "prompt_id": pid,
                         "prompt": prompt,
                         "generated_text": text,
                         "token_pos": pos,
+                        "token_pos_relative": token_pos_relative,
                         "num_tokens": len(tokens),
+                        "num_tokens_relative": num_tokens_relative,
                         "token": tokens[pos],
                         "feature_id": fid,
                         "activation": val,
@@ -206,7 +218,8 @@ class FeatureTracer:
             return pd.DataFrame(
                 columns=[
                     "prompt_id", "prompt", "generated_text",
-                    "token_pos", "num_tokens", "token", "feature_id", "activation"
+                    "token_pos", "token_pos_relative", "num_tokens", 
+                    "num_tokens_relative", "token", "feature_id", "activation"
                 ]
             )
         return pd.DataFrame(self._rows)

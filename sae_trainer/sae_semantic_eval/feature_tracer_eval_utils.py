@@ -202,7 +202,7 @@ def render_feature_card(
     axes[0].set_xlabel("activation")
     axes[0].set_ylabel("count")
 
-    rel_pos = (sub["token_pos"] / sub["num_tokens"]).round(2)
+    rel_pos = (sub["token_pos_relative"] / sub["num_tokens_relative"]).round(2)
     rel_pos_counts = rel_pos.value_counts().sort_index()
     axes[1].plot(rel_pos_counts.index, rel_pos_counts.values, marker="o", color="#e67e22")
     axes[1].set_title("Relative Token Position Profile")
