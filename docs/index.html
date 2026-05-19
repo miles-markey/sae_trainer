@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SAE Feature Explorer</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.27.0/plotly.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0d0f14;
+      --surface: #141720;
+      --surface2: #1c2030;
+      --border: #252a3a;
+      --accent: #4f8ef7;
+      --accent2: #e05c5c;
+      --accent3: #f0a04b;
+      --text: #e8eaf0;
+      --text-muted: #6b7280;
+      --text-dim: #9ca3af;
+      --mono: 'JetBrains Mono', monospace;
+      --sans: 'DM Sans', sans-serif;
+      --radius: 8px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* subtle grid background */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(79,142,247,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(79,142,247,0.03) 1px, transparent 1px);
+      background-size: 40px 40px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    header {
+      position: relative;
+      z-index: 1;
+      padding: 28px 40px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: baseline;
+      gap: 16px;
+    }
+
+    header h1 {
+      font-family: var(--mono);
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: var(--accent);
+      letter-spacing: 0.02em;
+    }
+
+    header span {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      font-family: var(--mono);
+    }
+
+    .tag {
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      padding: 2px 8px;
+      border-radius: 4px;
+      background: rgba(79,142,247,0.12);
+      color: var(--accent);
+      border: 1px solid rgba(79,142,247,0.25);
+    }
+
+    .layout {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0;
+      height: calc(100vh - 73px);
+    }
+
+    .panel {
+      padding: 24px;
+      overflow-y: auto;
+      border-right: 1px solid var(--border);
+    }
+
+    .panel:last-child { border-right: none; }
+
+    .panel-label {
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .panel-label::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+
+    #scatter-container {
+      width: 100%;
+      height: calc(100% - 32px);
+      min-height: 400px;
+    }
+
+    /* Feature card styles */
+    #card-panel {
+      background: var(--surface);
+    }
+
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: calc(100% - 32px);
+      gap: 12px;
+      color: var(--text-muted);
+    }
+
+    .empty-state .icon {
+      font-size: 2rem;
+      opacity: 0.3;
+    }
+
+    .empty-state p {
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      text-align: center;
+      line-height: 1.6;
+    }
+
+    .feature-card {
+      animation: fadeIn 0.2s ease;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .card-feature-id {
+      font-family: var(--mono);
+      font-size: 1.4rem;
+      font-weight: 600;
+      color: var(--accent);
+    }
+
+    .card-stats {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .stat {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .stat-label {
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .stat-value {
+      font-family: var(--mono);
+      font-size: 0.85rem;
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .contexts-label {
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 10px;
+    }
+
+    .context-row {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent2);
+      border-radius: 0 var(--radius) var(--radius) 0;
+      padding: 10px 14px;
+      margin-bottom: 8px;
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      line-height: 1.7;
+      transition: border-color 0.15s;
+    }
+
+    .context-meta {
+      font-size: 0.65rem;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+
+    .context-text {
+      color: var(--text-dim);
+      word-break: break-word;
+    }
+
+    .token-highlight {
+      color: var(--text);
+      font-weight: 600;
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+
+    .score-bars {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .score-bar-wrap {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+    }
+
+    .score-bar-label {
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 6px;
+    }
+
+    .score-bar-track {
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+      margin-bottom: 5px;
+    }
+
+    .score-bar-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width 0.4s cubic-bezier(0.4,0,0.2,1);
+    }
+
+    .score-bar-val {
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      font-weight: 600;
+    }
+
+    .mini-charts {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 16px;
+    }
+
+    .mini-chart-wrap {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px;
+    }
+
+    .mini-chart-title {
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 8px;
+    }
+
+    .loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .spinner {
+      width: 28px;
+      height: 28px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .loading p {
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      color: var(--text-muted);
+    }
+
+    /* scrollbar */
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3a4060; }
+
+    .composite-badge {
+      margin-left: auto;
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      padding: 3px 10px;
+      border-radius: 20px;
+      background: rgba(240,160,75,0.12);
+      border: 1px solid rgba(240,160,75,0.3);
+      color: var(--accent3);
+    }
+  </style>
+</head>
+<body>
+
+<div class="loading" id="loading">
+  <div class="spinner"></div>
+  <p>Loading feature data…</p>
+</div>
+
+<div id="app" style="display:none; height:100vh; display:none; flex-direction:column;">
+  <header>
+    <h1>sae_trainer</h1>
+    <span>/ feature explorer</span>
+    <span class="tag" id="feature-count-tag">— features</span>
+    <span class="tag" style="margin-left:auto; background:rgba(224,92,92,0.1); color:var(--accent2); border-color:rgba(224,92,92,0.25);">
+      Qwen-0.5B · Layer 12 · TopK k=40
+    </span>
+  </header>
+
+  <div class="layout">
+    <!-- Left: scatter -->
+    <div class="panel" id="scatter-panel">
+      <div class="panel-label">Feature Landscape</div>
+      <div id="scatter-container"></div>
+    </div>
+
+    <!-- Right: feature card -->
+    <div class="panel" id="card-panel">
+      <div class="panel-label">Feature Card</div>
+      <div id="card-content">
+        <div class="empty-state">
+          <div class="icon">◎</div>
+          <p>Hover or click a feature<br>in the scatter plot to inspect it.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── Config ───────────────────────────────────────────────────────────────────
+const SCORES_URL      = 'feature_scores.csv';
+const CARDS_URL       = 'feature_cards.json';
+const HOVER_DELAY_MS  = 120;   // debounce hover so fast mouse sweeps don't thrash
+
+// ─── State ────────────────────────────────────────────────────────────────────
+let scoresData  = [];   // array of row objects from CSV
+let cardsData   = {};   // keyed by feature_id string
+let hoverTimer  = null;
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function parseCSV(text) {
+  const lines = text.trim().split('\n');
+  const headers = lines[0].split(',').map(h => h.trim());
+  return lines.slice(1).map(line => {
+    // handle quoted fields
+    const vals = [];
+    let cur = '', inQ = false;
+    for (const ch of line) {
+      if (ch === '"') { inQ = !inQ; }
+      else if (ch === ',' && !inQ) { vals.push(cur.trim()); cur = ''; }
+      else cur += ch;
+    }
+    vals.push(cur.trim());
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = vals[i] ?? ''; });
+    return obj;
+  });
+}
+
+function esc(str) {
+  return String(str ?? '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function fmt(v, decimals = 3) {
+  const n = parseFloat(v);
+  return isNaN(n) ? '—' : n.toFixed(decimals);
+}
+
+// map a 0-1 value to a red opacity for context row left border
+function actOpacity(act, minAct, maxAct) {
+  const range = maxAct - minAct + 1e-8;
+  return (0.25 + 0.75 * (act - minAct) / range).toFixed(2);
+}
+
+// ─── Scatter ──────────────────────────────────────────────────────────────────
+function buildScatter(scores) {
+  const x     = scores.map(r => parseFloat(r.token_specificity_vs_baseline));
+  const y     = scores.map(r => parseFloat(r.context_specificity_vs_baseline));
+  const comp  = scores.map(r => parseFloat(r.composite_score));
+  const ids   = scores.map(r => r.feature_id);
+  const fire  = scores.map(r => parseFloat(r.firing_rate ?? 0));
+
+  const compMin = Math.min(...comp.filter(v => !isNaN(v)));
+  const compMax = Math.max(...comp.filter(v => !isNaN(v)));
+  const norm = comp.map(v => (v - compMin) / (compMax - compMin + 1e-8));
+
+  const customdata = scores.map((r, i) => ({
+    feature_id:   r.feature_id,
+    composite:    fmt(r.composite_score),
+    mean_act:     fmt(r.mean_activation),
+    firing_rate:  fmt(r.firing_rate, 4),
+    ctx:          fmt(r.context_specificity_vs_baseline),
+    tok:          fmt(r.token_specificity_vs_baseline),
+  }));
+
+  const trace = {
+    x, y,
+    type: 'scatter',
+    mode: 'markers',
+    customdata,
+    marker: {
+      size: fire.map(f => 4 + f * 60),  // scale dot size by firing rate
+      color: norm,
+      colorscale: [
+        [0,   'rgba(79,142,247,0.5)'],
+        [0.5, 'rgba(240,160,75,0.7)'],
+        [1,   'rgba(224,92,92,0.9)'],
+      ],
+      line: { width: 0 },
+      opacity: 0.85,
+    },
+    hovertemplate:
+      '<b>Feature #%{customdata.feature_id}</b><br>' +
+      'Token spec: %{x:.3f}<br>' +
+      'Context spec: %{y:.3f}<br>' +
+      'Composite: %{customdata.composite}<br>' +
+      'Mean act: %{customdata.mean_act}<br>' +
+      'Firing rate: %{customdata.firing_rate}' +
+      '<extra></extra>',
+    ids,
+  };
+
+  const layout = {
+    paper_bgcolor: 'transparent',
+    plot_bgcolor:  'rgba(20,23,32,0.6)',
+    font: { family: 'JetBrains Mono, monospace', color: '#6b7280', size: 10 },
+    xaxis: {
+      title: { text: 'Token Specificity Score', font: { color: '#6b7280', size: 10 } },
+      gridcolor: '#1e2435',
+      zerolinecolor: '#252a3a',
+      tickfont: { size: 9 },
+    },
+    yaxis: {
+      title: { text: 'Context Specificity Score', font: { color: '#6b7280', size: 10 } },
+      gridcolor: '#1e2435',
+      zerolinecolor: '#252a3a',
+      tickfont: { size: 9 },
+    },
+    margin: { t: 16, r: 16, b: 60, l: 60 },
+    hovermode: 'closest',
+    hoverlabel: {
+      bgcolor: '#1c2030',
+      bordercolor: '#4f8ef7',
+      font: { family: 'JetBrains Mono', size: 11, color: '#e8eaf0' },
+    },
+    // Quadrant reference lines at median
+    shapes: [
+      {
+        type: 'line', x0: 0.5, x1: 0.5, y0: 0, y1: 1, xref: 'paper', yref: 'paper',
+        line: { color: '#252a3a', width: 1, dash: 'dot' }
+      },
+      {
+        type: 'line', x0: 0, x1: 1, y0: 0.5, y1: 0.5, xref: 'paper', yref: 'paper',
+        line: { color: '#252a3a', width: 1, dash: 'dot' }
+      },
+    ],
+    annotations: [
+      { x: 0.97, y: 0.97, xref:'paper', yref:'paper', text:'Most<br>Interpretable',
+        showarrow:false, font:{size:8, color:'rgba(79,142,247,0.4)'}, align:'right' },
+      { x: 0.03, y: 0.03, xref:'paper', yref:'paper', text:'Noisy /<br>Dead',
+        showarrow:false, font:{size:8, color:'rgba(150,150,150,0.3)'}, align:'left' },
+      { x: 0.03, y: 0.97, xref:'paper', yref:'paper', text:'Semantic /<br>Conceptual',
+        showarrow:false, font:{size:8, color:'rgba(240,160,75,0.3)'}, align:'left' },
+      { x: 0.97, y: 0.03, xref:'paper', yref:'paper', text:'Token-<br>Anchored',
+        showarrow:false, font:{size:8, color:'rgba(224,92,92,0.3)'}, align:'right' },
+    ],
+  };
+
+  const config = {
+    responsive: true,
+    displayModeBar: true,
+    modeBarButtonsToRemove: ['lasso2d','select2d','toImage'],
+    displaylogo: false,
+  };
+
+  Plotly.newPlot('scatter-container', [trace], layout, config);
+
+  // hover → debounced card render
+  document.getElementById('scatter-container').on('plotly_hover', data => {
+    clearTimeout(hoverTimer);
+    const pt = data.points[0];
+    hoverTimer = setTimeout(() => renderCard(pt.customdata.feature_id), HOVER_DELAY_MS);
+  });
+
+  // click → immediate card render + highlight
+  document.getElementById('scatter-container').on('plotly_click', data => {
+    clearTimeout(hoverTimer);
+    const pt = data.points[0];
+    renderCard(pt.customdata.feature_id);
+  });
+}
+
+// ─── Feature Card ─────────────────────────────────────────────────────────────
+function renderCard(featureIdStr) {
+  const fid  = String(featureIdStr);
+  const card = cardsData[fid];
+  const row  = scoresData.find(r => String(r.feature_id) === fid);
+
+  if (!card && !row) {
+    document.getElementById('card-content').innerHTML =
+      `<div class="empty-state"><p style="color:var(--accent2)">No data for feature #${esc(fid)}</p></div>`;
+    return;
+  }
+
+  const ctxScore  = parseFloat(row?.context_specificity_vs_baseline ?? 0);
+  const tokScore  = parseFloat(row?.token_specificity_vs_baseline   ?? 0);
+  const composite = parseFloat(row?.composite_score  ?? 0);
+  const meanAct   = parseFloat(row?.mean_activation  ?? 0);
+  const firingRate= parseFloat(row?.firing_rate       ?? 0);
+
+  const contexts  = card?.contexts ?? [];
+  const activations = card?.activations ?? [];
+  const relPos    = card?.position_profile ?? [];
+
+  // activation range for opacity scaling
+  const acts  = contexts.map(c => c.activation);
+  const minA  = Math.min(...acts, 0);
+  const maxA  = Math.max(...acts, 1);
+
+  // Normalise _vs_baseline scores to [0, 1] across the full dataset for bar widths
+  const allCtx = scoresData.map(r => parseFloat(r.context_specificity_vs_baseline)).filter(v => !isNaN(v));
+  const allTok = scoresData.map(r => parseFloat(r.token_specificity_vs_baseline)).filter(v => !isNaN(v));
+  const ctxNorm = (ctxScore - Math.min(...allCtx)) / (Math.max(...allCtx) - Math.min(...allCtx) + 1e-8);
+  const tokNorm = (tokScore - Math.min(...allTok)) / (Math.max(...allTok) - Math.min(...allTok) + 1e-8);
+
+  // score bar colors
+  const ctxColor = `hsl(${Math.round(ctxNorm * 120)}, 70%, 55%)`;
+  const tokColor = `hsl(${Math.round(tokNorm * 120)}, 70%, 55%)`;
+
+  // context rows HTML
+  const ctxRows = contexts.slice(0, 5).map(c => {
+    const op  = actOpacity(c.activation, minA, maxA);
+    const bg  = `rgba(224,92,92,${op})`;
+    return `
+    <div class="context-row" style="border-left-color: rgba(224,92,92,${op});">
+      <div class="context-meta">[pos=${c.token_pos ?? '?'} · act=${fmt(c.activation)}]</div>
+      <div class="context-text">…${esc(c.pre)}<span class="token-highlight" style="background:${bg};">${esc(c.mid)}</span>${esc(c.post)}…</div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('card-content').innerHTML = `
+  <div class="feature-card">
+    <div class="card-header">
+      <div class="card-feature-id">Feature #${esc(fid)}</div>
+      <div class="composite-badge">composite ${fmt(composite)}</div>
+    </div>
+
+    <div class="card-stats" style="margin-bottom:16px;">
+      <div class="stat">
+        <span class="stat-label">Mean Act</span>
+        <span class="stat-value">${fmt(meanAct)}</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Firing Rate</span>
+        <span class="stat-value">${fmt(firingRate, 4)}</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Contexts shown</span>
+        <span class="stat-value">${contexts.length}</span>
+      </div>
+    </div>
+
+    <div class="score-bars">
+      <div class="score-bar-wrap">
+        <div class="score-bar-label">Context Specificity</div>
+        <div class="score-bar-track">
+          <div class="score-bar-fill" style="width:${(ctxNorm*100).toFixed(1)}%; background:${ctxColor};"></div>
+        </div>
+        <div class="score-bar-val" style="color:${ctxColor};">${fmt(ctxScore)}</div>
+      </div>
+      <div class="score-bar-wrap">
+        <div class="score-bar-label">Token Specificity</div>
+        <div class="score-bar-track">
+          <div class="score-bar-fill" style="width:${(tokNorm*100).toFixed(1)}%; background:${tokColor};"></div>
+        </div>
+        <div class="score-bar-val" style="color:${tokColor};">${fmt(tokScore)}</div>
+      </div>
+    </div>
+
+    <div class="contexts-label">Top Activating Contexts</div>
+    ${ctxRows || '<p style="color:var(--text-muted);font-family:var(--mono);font-size:0.78rem;">No contexts available.</p>'}
+
+    <div class="mini-charts">
+      <div class="mini-chart-wrap">
+        <div class="mini-chart-title">Activation Distribution</div>
+        <div id="mini-hist" style="height:110px;"></div>
+      </div>
+      <div class="mini-chart-wrap">
+        <div class="mini-chart-title">Relative Token Position</div>
+        <div id="mini-pos" style="height:110px;"></div>
+      </div>
+    </div>
+  </div>`;
+
+  // mini histogram
+  if (activations.length > 0) {
+    Plotly.newPlot('mini-hist', [{
+      x: activations, type: 'histogram',
+      marker: { color: 'rgba(79,142,247,0.7)', line: { width: 0 } },
+      nbinsx: 20,
+    }], {
+      paper_bgcolor:'transparent', plot_bgcolor:'transparent',
+      margin: { t:4, r:4, b:28, l:28 },
+      font: { family:'JetBrains Mono', size:8, color:'#6b7280' },
+      xaxis: { gridcolor:'#1e2435', zerolinecolor:'#252a3a', tickfont:{size:7} },
+      yaxis: { gridcolor:'#1e2435', zerolinecolor:'#252a3a', tickfont:{size:7} },
+    }, { displayModeBar:false, responsive:true });
+  }
+
+  // mini position profile
+  if (relPos.length > 0) {
+    // relPos is array of {position, count} or flat array of values
+    let posX, posY;
+    if (typeof relPos[0] === 'object') {
+      posX = relPos.map(p => p.rel_pos);
+      posY = relPos.map(p => p.hits);
+    } else {
+      // raw array of relative positions — bin them
+      const bins = {};
+      relPos.forEach(v => {
+        const b = Math.round(parseFloat(v) * 20) / 20;
+        bins[b] = (bins[b] || 0) + 1;
+      });
+      posX = Object.keys(bins).map(Number).sort((a,b)=>a-b);
+      posY = posX.map(k => bins[k]);
+    }
+    Plotly.newPlot('mini-pos', [{
+      x: posX, y: posY, type: 'scatter', mode: 'lines+markers',
+      line: { color: '#e67e22', width: 1.5 },
+      marker: { color: '#e67e22', size: 3 },
+    }], {
+      paper_bgcolor:'transparent', plot_bgcolor:'transparent',
+      margin: { t:4, r:4, b:28, l:28 },
+      font: { family:'JetBrains Mono', size:8, color:'#6b7280' },
+      xaxis: { range:[0,1], gridcolor:'#1e2435', zerolinecolor:'#252a3a', tickfont:{size:7} },
+      yaxis: { gridcolor:'#1e2435', zerolinecolor:'#252a3a', tickfont:{size:7} },
+    }, { displayModeBar:false, responsive:true });
+  }
+}
+
+// ─── Boot ─────────────────────────────────────────────────────────────────────
+async function init() {
+  try {
+    const [csvText, cardsJson] = await Promise.all([
+      fetch(SCORES_URL).then(r => { if(!r.ok) throw new Error(`CSV: ${r.status}`); return r.text(); }),
+      fetch(CARDS_URL ).then(r => { if(!r.ok) throw new Error(`JSON: ${r.status}`); return r.json(); }),
+    ]);
+
+    scoresData = parseCSV(csvText);
+    cardsData  = cardsJson;  // expected: { "1234": { contexts:[...], activations:[...], relative_positions:[...] }, ... }
+
+    document.getElementById('loading').style.display = 'none';
+    const app = document.getElementById('app');
+    app.style.display = 'flex';
+
+    document.getElementById('feature-count-tag').textContent =
+      `${scoresData.length.toLocaleString()} features`;
+
+    buildScatter(scoresData);
+
+  } catch (err) {
+    document.getElementById('loading').innerHTML = `
+      <div style="text-align:center; font-family:'JetBrains Mono',monospace; color:#e05c5c;">
+        <p style="font-size:1.1rem; margin-bottom:8px;">Failed to load data</p>
+        <p style="font-size:0.78rem; color:#6b7280;">${esc(err.message)}</p>
+        <p style="font-size:0.72rem; color:#4a4f65; margin-top:12px;">
+          Make sure feature_scores.csv and feature_cards.json are in the same directory.
+        </p>
+      </div>`;
+  }
+}
+
+init();
+</script>
+</body>
+</html>
