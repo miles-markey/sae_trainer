@@ -1,5 +1,7 @@
 # sae_trainer
 
+See demo at: https://miles-markey.github.io/sae_trainer/
+
 ## Setup instructions
 
 ### 1. Python
