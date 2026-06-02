@@ -1284,3 +1284,120 @@ def plot_prompt_vs_response_features(
         )],
         layout=layout,
     ).show()
+
+
+def build_feature_persistence_df(
+    prompt_tracer: FeatureTracer,
+    response_tracer: FeatureTracer,
+    min_context_specificity_vs_baseline: float | None = None,
+    max_token_specificity_vs_baseline: float | None = None,
+    min_embedding_sim: float | None = None,
+    min_activation: float = 0.0,
+) -> pd.DataFrame:
+    """
+    Build a tidy (prompt_id, feature_id) DataFrame describing how each SAE feature
+    behaves across the prompt and response portions of each traced prompt.
+
+    One row per (prompt_id, feature_id) pair where the feature fired in at least one
+    portion. Columns:
+      prompt_id, feature_id,
+      prompt_activation          — mean activation over prompt tokens (0 if didn't fire)
+      response_activation        — mean activation over response tokens (0 if didn't fire)
+      embedding_sim              — cosine similarity between the feature's mean context
+                                   embeddings in prompt_tracer vs response_tracer;
+                                   NaN if compute_feature_embeddings() not yet called
+      context_specificity_vs_baseline  — from prompt_tracer specificity scores
+      token_specificity_vs_baseline    — from prompt_tracer specificity scores
+                                         (NaN if feature_specificity_scores() not yet called)
+
+    embedding_sim and specificity scores are feature-level properties (the same value
+    appears on every row for a given feature_id). prompt_activation / response_activation
+    are per-prompt.
+
+    The optional filter arguments narrow the output to features of interest. Keeping the
+    unfiltered DataFrame and re-filtering in the notebook is cheap; the expensive steps
+    (tracing, embedding, scoring) only run once.
+    """
+    p_df = prompt_tracer.to_dataframe()
+    r_df = response_tracer.to_dataframe()
+
+    shared_pids = set(p_df["prompt_id"].unique()) & set(r_df["prompt_id"].unique())
+    if not shared_pids:
+        return pd.DataFrame(columns=[
+            "prompt_id", "feature_id", "prompt_activation", "response_activation",
+            "embedding_sim", "context_specificity_vs_baseline", "token_specificity_vs_baseline",
+        ])
+
+    p_df = p_df[p_df["prompt_id"].isin(shared_pids)]
+    r_df = r_df[r_df["prompt_id"].isin(shared_pids)]
+
+    # Mean activation per (prompt_id, feature_id)
+    p_agg = (
+        p_df.groupby(["prompt_id", "feature_id"])["activation"]
+        .mean()
+        .rename("prompt_activation")
+    )
+    r_agg = (
+        r_df.groupby(["prompt_id", "feature_id"])["activation"]
+        .mean()
+        .rename("response_activation")
+    )
+
+    # Outer join: keep features that fired in either portion
+    combined = (
+        p_agg.to_frame()
+        .join(r_agg, how="outer")
+        .fillna(0.0)
+        .reset_index()
+    )
+
+    # Drop rows where neither side clears min_activation
+    combined = combined[
+        (combined["prompt_activation"] >= min_activation) |
+        (combined["response_activation"] >= min_activation)
+    ].copy()
+
+    # Feature-level embedding similarity
+    p_embs = prompt_tracer.get_feature_embeddings()
+    r_embs = response_tracer.get_feature_embeddings()
+    emb_sim_map: dict = {}
+    if p_embs and r_embs:
+        for fid in set(p_embs.keys()) & set(r_embs.keys()):
+            p_mean = p_embs[fid]["context_embeddings"].mean(axis=0)
+            p_mean /= np.linalg.norm(p_mean) + 1e-8
+            r_mean = r_embs[fid]["context_embeddings"].mean(axis=0)
+            r_mean /= np.linalg.norm(r_mean) + 1e-8
+            emb_sim_map[fid] = float(p_mean @ r_mean)
+
+    combined["embedding_sim"] = combined["feature_id"].map(emb_sim_map)
+
+    # Feature-level specificity scores from prompt_tracer
+    def _scores_lookup(col: str) -> dict | None:
+        try:
+            return prompt_tracer.get_feature_specificity_scores_df().set_index("feature_id")[col].to_dict()
+        except RuntimeError:
+            return None
+
+    ctx_scores = _scores_lookup("context_specificity_vs_baseline")
+    tok_scores = _scores_lookup("token_specificity_vs_baseline")
+
+    combined["context_specificity_vs_baseline"] = (
+        combined["feature_id"].map(ctx_scores) if ctx_scores else float("nan")
+    )
+    combined["token_specificity_vs_baseline"] = (
+        combined["feature_id"].map(tok_scores) if tok_scores else float("nan")
+    )
+
+    # Apply optional filters
+    if min_context_specificity_vs_baseline is not None and ctx_scores:
+        combined = combined[
+            combined["context_specificity_vs_baseline"] >= min_context_specificity_vs_baseline
+        ]
+    if max_token_specificity_vs_baseline is not None and tok_scores:
+        combined = combined[
+            combined["token_specificity_vs_baseline"] <= max_token_specificity_vs_baseline
+        ]
+    if min_embedding_sim is not None and emb_sim_map:
+        combined = combined[combined["embedding_sim"] >= min_embedding_sim]
+
+    return combined.reset_index(drop=True)
