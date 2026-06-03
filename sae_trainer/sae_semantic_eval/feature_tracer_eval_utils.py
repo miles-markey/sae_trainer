@@ -1401,3 +1401,175 @@ def build_feature_persistence_df(
         combined = combined[combined["embedding_sim"] >= min_embedding_sim]
 
     return combined.reset_index(drop=True)
+
+
+def get_feature_firing_by_prompt(
+    feature_id: int,
+    tracer: FeatureTracer,
+    prompt_ids: list | None = None,
+) -> pd.DataFrame:
+    """
+    For each prompt, report whether a given feature fired and with what activation statistics.
+
+    Returns a DataFrame with one row per prompt_id:
+      prompt_id, fired (bool), hits, mean_activation, max_activation
+
+    prompt_ids: if provided, every prompt_id in this list is included — prompts where
+    the feature didn't fire get fired=False and hits=0. If None, only prompts where
+    the feature fired are returned.
+
+    Typical use — group a dataset by whether a feature fired in the response:
+
+      firing = get_feature_firing_by_prompt(42, response_tracer, prompt_ids=all_ids)
+      fired_ids     = firing[firing["fired"]]["prompt_id"].tolist()
+      not_fired_ids = firing[~firing["fired"]]["prompt_id"].tolist()
+    """
+    df = tracer.to_dataframe()
+    feature_df = df[df["feature_id"] == feature_id]
+
+    stats = (
+        feature_df.groupby("prompt_id")
+        .agg(
+            hits=("activation", "count"),
+            mean_activation=("activation", "mean"),
+            max_activation=("activation", "max"),
+        )
+        .reset_index()
+        .assign(fired=True)
+    )
+
+    if prompt_ids is not None:
+        all_pids = pd.DataFrame({"prompt_id": [str(p) for p in prompt_ids]})
+        stats["prompt_id"] = stats["prompt_id"].astype(str)
+        result = all_pids.merge(stats, on="prompt_id", how="left")
+        result["fired"] = result["fired"].fillna(False).astype(bool)
+        result["hits"] = result["hits"].fillna(0).astype(int)
+    else:
+        result = stats
+
+    return result.reset_index(drop=True)
+
+
+def _find_token_positions_for_substring(
+    substring: str,
+    generated_text: str,
+    tokenizer,
+    search_start: int = 0,
+    search_end: int | None = None,
+) -> list[int]:
+    """
+    Return absolute token positions (in generated_text) whose decoded text overlaps
+    with any occurrence of substring (case-insensitive).
+
+    search_start / search_end restrict the search to a slice of the token sequence,
+    e.g. to confine the search to the response portion.
+    """
+    token_ids = tokenizer(generated_text, return_tensors="pt")["input_ids"][0]
+    tokens = tokenizer.convert_ids_to_tokens(token_ids.tolist())
+
+    # Build per-token character spans in the fully decoded string
+    decoded = ""
+    char_starts: list[int] = []
+    char_ends: list[int] = []
+    for tok in tokens:
+        s = tokenizer.convert_tokens_to_string([tok])
+        char_starts.append(len(decoded))
+        decoded += s
+        char_ends.append(len(decoded))
+
+    sub_lower = substring.lower()
+    text_lower = decoded.lower()
+    matching: set[int] = set()
+    search_from = 0
+    while True:
+        found = text_lower.find(sub_lower, search_from)
+        if found == -1:
+            break
+        sub_end = found + len(substring)
+        for pos, (cs, ce) in enumerate(zip(char_starts, char_ends)):
+            if pos < search_start:
+                continue
+            if search_end is not None and pos >= search_end:
+                continue
+            if cs < sub_end and ce > found:
+                matching.add(pos)
+        search_from = found + 1
+
+    return sorted(matching)
+
+
+def inspect_substring_features(
+    substring: str,
+    prompt_id,
+    prompt_tracer: FeatureTracer,
+    response_tracer: FeatureTracer,
+    top_n_features: int = 5,
+    window: int = 8,
+) -> pd.DataFrame:
+    """
+    For a given prompt, find the SAE features that most strongly activate on a
+    specific substring in the response, then render a full prompt/response token card
+    for each top feature showing every other location in the prompt and response where
+    that feature fires.
+
+    Workflow:
+      1. Locates all token positions in the response portion that overlap with
+         `substring` (case-insensitive, handles multi-token substrings).
+      2. Ranks features by (hits, mean_activation) at those positions for this prompt.
+      3. Prints a summary table of the top features.
+      4. Calls render_prompt_response_token_card for each, highlighting the full
+         prompt/response sequence so you can see where else the feature fires.
+
+    Returns the top-features DataFrame for further inspection or filtering.
+    """
+    pid = str(prompt_id)
+    tokenizer = response_tracer.tokenizer
+
+    r_df = response_tracer.to_dataframe()
+    r_pid = r_df[r_df["prompt_id"] == pid]
+    if r_pid.empty:
+        print(f"prompt_id {pid!r} not found in response_tracer.")
+        return pd.DataFrame()
+
+    # Recover prompt/response boundary from stored relative position fields
+    row0 = r_pid.iloc[0]
+    num_prompt_tokens = int(row0["token_pos"] - row0["token_pos_relative"])
+    generated_text = row0["generated_text"]
+
+    # Find token positions in the response portion that overlap with the substring
+    matching_positions = _find_token_positions_for_substring(
+        substring, generated_text, tokenizer,
+        search_start=num_prompt_tokens,
+    )
+    if not matching_positions:
+        print(f"Substring {substring!r} not found in the response for prompt {pid!r}.")
+        return pd.DataFrame()
+
+    print(f"Substring {substring!r} spans token position(s): {matching_positions}")
+
+    # Top features at those positions for this specific prompt
+    sub = r_pid[r_pid["token_pos"].isin(matching_positions)]
+    if sub.empty:
+        print("No SAE features recorded at those positions — try lowering min_activation in TraceConfig.")
+        return pd.DataFrame()
+
+    top_feats = (
+        sub.groupby("feature_id")
+        .agg(
+            hits=("feature_id", "count"),
+            mean_activation=("activation", "mean"),
+            max_activation=("activation", "max"),
+        )
+        .sort_values(["hits", "mean_activation"], ascending=False)
+        .head(top_n_features)
+        .reset_index()
+    )
+
+    print(f"\nTop {len(top_feats)} features activating on {substring!r} in prompt {pid!r}:")
+    ipy_display(top_feats)
+
+    # Render a full prompt/response token card for each top feature
+    # for fid in top_feats["feature_id"].tolist():
+    #     render_prompt_response_token_card(int(fid), pid, prompt_tracer, response_tracer)
+
+    return top_feats
