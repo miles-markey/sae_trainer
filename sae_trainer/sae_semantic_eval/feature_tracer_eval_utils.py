@@ -1547,8 +1547,74 @@ def inspect_substring_features(
 
     print(f"Substring {substring!r} spans token position(s): {matching_positions}")
 
+    top_feats = _inspect_token_pos_features(pid=pid, pids=r_pid, positions=matching_positions, top_n_features=top_n_features)
+
+    return top_feats
+
+
+def inspect_token_position_features(
+    token_pos: int | list[int],
+    prompt_id,
+    prompt_tracer: FeatureTracer,
+    response_tracer: FeatureTracer,
+    top_n_features: int = 5,
+    region: str | None = None,
+) -> pd.DataFrame:
+    """
+    For a given prompt, find the top SAE features activating at specific token
+    position(s), then render a full prompt/response token card for each, showing
+    everywhere else those features fire.
+
+    token_pos: a single position or list of positions.
+               For a contiguous range use list(range(start, end + 1)).
+
+    region: controls how token_pos is interpreted.
+      None (default) — absolute positions across the full sequence
+      "response"     — positions relative to the start of the response
+                       (0 = first generated token, 1 = second, etc.)
+      "prompt"       — positions relative to the start of the prompt
+                       (equivalent to absolute since the prompt starts at 0)
+
+    Features are looked up across both prompt and response portions, so this works
+    regardless of where the resolved positions fall.
+    """
+    pid = str(prompt_id)
+    positions = [token_pos] if isinstance(token_pos, int) else list(token_pos)
+
+    p_pid = prompt_tracer.to_dataframe()
+    p_pid = p_pid[p_pid["prompt_id"] == pid]
+    r_pid = response_tracer.to_dataframe()
+    r_pid = r_pid[r_pid["prompt_id"] == pid]
+
+    if p_pid.empty and r_pid.empty:
+        print(f"prompt_id {pid!r} not found in either tracer.")
+        return pd.DataFrame()
+
+    if region == "response":
+        if r_pid.empty:
+            print(f"prompt_id {pid!r} not found in response_tracer — cannot resolve response-relative positions.")
+            return pd.DataFrame()
+        row0 = r_pid.iloc[0]
+        num_prompt_tokens = int(row0["token_pos"] - row0["token_pos_relative"])
+        positions = [p + num_prompt_tokens for p in positions]
+    elif region is not None and region != "prompt":
+        raise ValueError(f"region must be 'prompt', 'response', or None; got {region!r}")
+
+    combined = pd.concat([p_pid, r_pid], ignore_index=True)
+
+    top_feats = _inspect_token_pos_features(pid=pid, pids=combined, positions=positions, top_n_features=top_n_features)
+
+    return top_feats
+
+def _inspect_token_pos_features(
+        pid, 
+        pids, 
+        positions, 
+        top_n_features: int = 5
+    ) -> pd.DataFrame:
+
     # Top features at those positions for this specific prompt
-    sub = r_pid[r_pid["token_pos"].isin(matching_positions)]
+    sub = pids[pids["token_pos"].isin(positions)]
     if sub.empty:
         print("No SAE features recorded at those positions — try lowering min_activation in TraceConfig.")
         return pd.DataFrame()
@@ -1565,7 +1631,7 @@ def inspect_substring_features(
         .reset_index()
     )
 
-    print(f"\nTop {len(top_feats)} features activating on {substring!r} in prompt {pid!r}:")
+    print(f"Top {len(top_feats)} features at position(s) {positions} in prompt {pid!r}:")
     ipy_display(top_feats)
 
     # Render a full prompt/response token card for each top feature
