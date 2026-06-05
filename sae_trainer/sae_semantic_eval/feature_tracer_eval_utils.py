@@ -1450,6 +1450,79 @@ def get_feature_firing_by_prompt(
     return result.reset_index(drop=True)
 
 
+def build_prompt_feature_spectrum(
+    prompt_id,
+    tracer: FeatureTracer,
+    n_features: int,
+) -> pd.DataFrame:
+    """
+    Build a feature activation spectrum for a single prompt — an N×M DataFrame where
+    N = all SAE features (0..n_features-1) and M = per-feature summary statistics.
+
+    Including all features (including inactive ones with zeros) gives a fixed-length
+    representation across prompts, enabling direct comparison via cosine similarity,
+    clustering, dimensionality reduction, etc.
+
+    Columns:
+      feature_id
+      hits                     — number of token positions where the feature fired
+      firing_rate              — hits / total_traced_tokens (length-normalized)
+      mean_activation          — mean activation over firing positions (0 if inactive)
+      median_activation        — median activation over firing positions (0 if inactive)
+      max_activation           — peak activation (0 if inactive)
+      min_activation           — minimum firing activation (0 if inactive)
+      std_activation           — population std of activations (0 if inactive)
+      mean_token_pos_relative  — mean relative position of firings in [0, 1] (NaN if inactive)
+      positional_spread        — population std of relative token positions (NaN if inactive)
+      activation_concentration — max / sum of activations; 1.0 = single dominant hit,
+                                 lower = mass spread across many positions (NaN if inactive)
+    """
+    pid = str(prompt_id)
+    df = tracer.to_dataframe()
+    df_pid = df[df["prompt_id"] == pid].copy()
+
+    full_index = pd.DataFrame({"feature_id": range(n_features)})
+
+    if df_pid.empty:
+        result = full_index.copy()
+        for col in ["hits", "firing_rate", "mean_activation", "median_activation",
+                    "max_activation", "min_activation", "std_activation"]:
+            result[col] = 0.0
+        for col in ["mean_token_pos_relative", "positional_spread", "activation_concentration"]:
+            result[col] = float("nan")
+        result["hits"] = result["hits"].astype(int)
+        return result
+
+    total_tokens = df_pid["token_pos"].nunique()
+    df_pid["rel_pos"] = df_pid["token_pos_relative"] / df_pid["num_tokens_relative"]
+
+    grp = df_pid.groupby("feature_id")
+
+    active_stats = grp.agg(
+        hits=("activation", "count"),
+        mean_activation=("activation", "mean"),
+        median_activation=("activation", "median"),
+        max_activation=("activation", "max"),
+        min_activation=("activation", "min"),
+        mean_token_pos_relative=("rel_pos", "mean"),
+    ).reset_index()
+
+    active_stats["std_activation"] = grp["activation"].apply(np.std).values
+    active_stats["positional_spread"] = grp["rel_pos"].apply(np.std).values
+    active_stats["activation_concentration"] = (
+        grp["activation"].max() / grp["activation"].sum()
+    ).values
+    active_stats["firing_rate"] = active_stats["hits"] / max(total_tokens, 1)
+
+    result = full_index.merge(active_stats, on="feature_id", how="left")
+    fill_zero = ["hits", "firing_rate", "mean_activation", "median_activation",
+                 "max_activation", "min_activation", "std_activation"]
+    result[fill_zero] = result[fill_zero].fillna(0.0)
+    result["hits"] = result["hits"].astype(int)
+
+    return result
+
+
 def _find_token_positions_for_substring(
     substring: str,
     generated_text: str,
