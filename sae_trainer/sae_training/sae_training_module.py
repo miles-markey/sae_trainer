@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-from .model_utils import ReluSparseAutoencoder, TopKSparseAutoencoder
+from ..core.model_utils import ReluSparseAutoencoder, TopKSparseAutoencoder
 from .train_utils import resample_dead_features, firing_rate_kl_loss
 
 class SAETrainingModule(ABC):

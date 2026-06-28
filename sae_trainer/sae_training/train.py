@@ -15,10 +15,10 @@ from datasets import load_dataset
 
 import wandb
 
-from .dataset_utils import make_collate_fn, TextDataset, get_data_loaders
+from ..core.dataset_utils import make_collate_fn, TextDataset, get_data_loaders
 from .sae_training_module import ReluSAETrainingModule, TopKSAETrainingModule
-from .eval_utils import evaluate_sae, visualize_sae
-from .model_utils import ReluSparseAutoencoder, TopKSparseAutoencoder
+from ..sae_semantic_eval.eval_utils import evaluate_sae, visualize_sae
+from ..core.model_utils import ReluSparseAutoencoder, TopKSparseAutoencoder
 from .activation_collector_utils import GPT2ActivationCollector, QwenActivationCollector
 
 def load_config(path: str) -> SimpleNamespace:
@@ -68,7 +68,7 @@ def training_wrapper(cfg, accum, layer_idx, device, save_mode=False, show_curves
         run.finish()
 
     if save_mode:
-        save_filename = f"{cfg.sae_type}_sae_{cfg.model_name}_{cfg.dataset_name}_layer{layer_idx}.pt"
+        save_filename = f"model_weights_files/{cfg.sae_type}_sae_{cfg.model_name}_{cfg.dataset_name}_layer{layer_idx}.pt"
         # ---- Save checkpoint ----
         ckpt = {
             "model_state": sae.state_dict(),
