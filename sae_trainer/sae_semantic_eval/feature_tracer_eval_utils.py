@@ -1357,19 +1357,27 @@ def build_feature_persistence_df(
         (combined["response_activation"] >= min_activation)
     ].copy()
 
-    # Feature-level embedding similarity
+    # Per-(prompt_id, feature_id) embedding similarity:
+    # cosine similarity between the mean context embedding for this feature on
+    # this specific prompt in prompt_tracer vs response_tracer.
     p_embs = prompt_tracer.get_feature_embeddings()
     r_embs = response_tracer.get_feature_embeddings()
-    emb_sim_map: dict = {}
+    emb_sim_map: dict = {}  # keyed by (str(prompt_id), feature_id)
     if p_embs and r_embs:
         for fid in set(p_embs.keys()) & set(r_embs.keys()):
-            p_mean = p_embs[fid]["context_embeddings"].mean(axis=0)
-            p_mean /= np.linalg.norm(p_mean) + 1e-8
-            r_mean = r_embs[fid]["context_embeddings"].mean(axis=0)
-            r_mean /= np.linalg.norm(r_mean) + 1e-8
-            emb_sim_map[fid] = float(p_mean @ r_mean)
+            p_pids = np.array([str(p) for p in p_embs[fid]["prompt_ids"]])
+            r_pids = np.array([str(p) for p in r_embs[fid]["prompt_ids"]])
+            for pid in set(p_pids) & set(r_pids):
+                p_mean = p_embs[fid]["context_embeddings"][p_pids == pid].mean(axis=0)
+                p_mean /= np.linalg.norm(p_mean) + 1e-8
+                r_mean = r_embs[fid]["context_embeddings"][r_pids == pid].mean(axis=0)
+                r_mean /= np.linalg.norm(r_mean) + 1e-8
+                emb_sim_map[(pid, fid)] = float(p_mean @ r_mean)
 
-    combined["embedding_sim"] = combined["feature_id"].map(emb_sim_map)
+    combined["embedding_sim"] = [
+        emb_sim_map.get((str(row.prompt_id), row.feature_id), float("nan"))
+        for row in combined.itertuples()
+    ]
 
     # Feature-level specificity scores from prompt_tracer
     def _scores_lookup(col: str) -> dict | None:
@@ -1521,6 +1529,120 @@ def build_prompt_feature_spectrum(
     result["hits"] = result["hits"].astype(int)
 
     return result
+
+
+def build_token_feature_spectrum(
+    prompt_id,
+    tracer: FeatureTracer,
+    n_features: int,
+) -> pd.DataFrame:
+    """
+    Build a token-level feature activation matrix for a single prompt.
+
+    Returns a DataFrame of shape (n_tokens_traced, n_features) where entry [t, f]
+    is the activation of feature f at absolute token position t (0 if didn't fire).
+
+    Index  = absolute token positions traced for this prompt (token_pos).
+    Columns = feature_ids 0..n_features-1.
+
+    Because most features are inactive at any given token, the matrix is very sparse.
+    For visualization, restrict to active columns first:
+
+        spectrum = build_token_feature_spectrum(pid, tracer, n_features)
+        active = spectrum.loc[:, (spectrum > 0).any()]  # drop all-zero feature columns
+    """
+    pid = str(prompt_id)
+    df = tracer.to_dataframe()
+    df_pid = df[df["prompt_id"] == pid]
+
+    if df_pid.empty:
+        return pd.DataFrame(columns=range(n_features), dtype=float)
+
+    matrix = df_pid.pivot_table(
+        index="token_pos",
+        columns="feature_id",
+        values="activation",
+        aggfunc="max",
+        fill_value=0.0,
+    )
+    # Ensure all n_features columns are present and ordered
+    matrix = matrix.reindex(columns=range(n_features), fill_value=0.0)
+    matrix.columns.name = "feature_id"
+    matrix.index.name = "token_pos"
+
+    return matrix
+
+
+def build_next_token_dataset(
+    tracer: FeatureTracer,
+    n_features: int,
+    history: str = "single",
+    window_size: int = 3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build (X, y) arrays for next-token feature spectrum prediction.
+
+    For each prompt, consecutive token positions form (input, target) pairs:
+      y  — feature vector at the next token position
+      X  — input feature representation, controlled by `history`:
+
+        "single"          X shape: (n_samples, n_features)
+                          feature vector at the immediately preceding token
+
+        "cumulative_mean" X shape: (n_samples, n_features)
+                          mean of all feature vectors from the first traced
+                          token up to and including the current token
+
+        "window"          X shape: (n_samples, window_size * n_features)
+                          last window_size feature vectors concatenated,
+                          zero-padded on the left when fewer than window_size
+                          tokens precede the target; most recent token last
+
+    Only pairs where the two positions are strictly adjacent (pos[i+1] == pos[i] + 1)
+    are included, so cross-prompt or cross-region boundaries are never paired.
+    """
+    if history not in ("single", "cumulative_mean", "window"):
+        raise ValueError(f"history must be 'single', 'cumulative_mean', or 'window'; got {history!r}")
+
+    X_list: list[np.ndarray] = []
+    y_list: list[np.ndarray] = []
+
+    for pid in tracer.to_dataframe()["prompt_id"].unique():
+        spectrum = build_token_feature_spectrum(pid, tracer, n_features)
+        if len(spectrum) < 2:
+            continue
+
+        positions = sorted(spectrum.index)
+        vals = spectrum.loc[positions].values  # (n_pos, n_features)
+
+        for i in range(len(positions) - 1):
+            if positions[i + 1] != positions[i] + 1:
+                continue  # skip non-adjacent pairs
+
+            y = vals[i + 1]
+
+            if history == "single":
+                x = vals[i]
+
+            elif history == "cumulative_mean":
+                x = vals[: i + 1].mean(axis=0)
+
+            elif history == "window":
+                start = max(0, i + 1 - window_size)
+                window = vals[start : i + 1]  # (<= window_size, n_features)
+                if len(window) < window_size:
+                    pad = np.zeros((window_size - len(window), n_features))
+                    window = np.vstack([pad, window])
+                x = window.flatten()  # (window_size * n_features,)
+
+            X_list.append(x)
+            y_list.append(y)
+
+    if not X_list:
+        x_cols = window_size * n_features if history == "window" else n_features
+        return np.empty((0, x_cols)), np.empty((0, n_features))
+
+    return np.stack(X_list), np.stack(y_list)
 
 
 def _find_token_positions_for_substring(
