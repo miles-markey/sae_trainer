@@ -5,6 +5,9 @@ expansion_factor: 8
 normalize_decoder: true
 k: 40
 collection_batch_size: 8
+target_layer_idxs:
+  - 3
+  - 6
 
 # Data
 dataset_name: wikitext
