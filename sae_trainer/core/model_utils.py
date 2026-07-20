@@ -58,6 +58,14 @@ class TopKSparseAutoencoder(SparseAutoencoder):
         z = torch.zeros_like(h).scatter_(-1, topk_idx, topk_vals)
         return self._decode(z), z
 
+def _get_layer(llm, layer_idx: int) -> nn.Module:
+    if hasattr(llm, "transformer") and hasattr(llm.transformer, "h"):
+        return llm.transformer.h[layer_idx]
+    if hasattr(llm, "model") and hasattr(llm.model, "layers"):
+        return llm.model.layers[layer_idx]
+    raise AttributeError(f"Cannot find layer {layer_idx} on {type(llm).__name__}")
+
+
 @contextmanager
 def sae_inserted_llm(llm, sae, layer_idx, device):
     """
@@ -74,15 +82,44 @@ def sae_inserted_llm(llm, sae, layer_idx, device):
             return (x_hat,) + output[1:]  # preserve KV cache etc.
         return x_hat
 
-    # Reuse FeatureTracer's layer-finding logic
-    if hasattr(llm, "transformer") and hasattr(llm.transformer, "h"):
-        layer = llm.transformer.h[layer_idx]         # GPT-2
-    elif hasattr(llm, "model") and hasattr(llm.model, "layers"):
-        layer = llm.model.layers[layer_idx]           # Qwen / LLaMA
-    else:
-        raise AttributeError(f"Cannot find layer {layer_idx} on {type(llm).__name__}")
+    handle = _get_layer(llm, layer_idx).register_forward_hook(_hook)
+    try:
+        yield
+    finally:
+        handle.remove()
 
-    handle = layer.register_forward_hook(_hook)
+
+@contextmanager
+def sae_steered_llm(llm, sae, layer_idx, feature_id: int, delta: float, device=None):
+    """
+    Context manager that steers a single SAE feature during LLM inference.
+
+    At each forward pass through layer_idx, the hidden state is encoded through
+    the SAE, the target feature's activation is shifted by `delta`, then the
+    modified latent is decoded back to hidden-state space.
+
+    delta > 0  — amplify / activate the feature
+    delta < 0  — suppress / ablate the feature
+    delta = 0  — equivalent to plain SAE insertion with no steering
+
+    Uses additive steering (z[feature_id] += delta) so the intervention works
+    even when the feature is not currently active (z = 0 after TopK sparsity).
+    To ablate completely regardless of current activation, use delta = -z[feature_id],
+    or clamp after adding: z[:, feature_id].clamp_(min=0).
+    """
+    def _hook(module, inputs, output):
+        h = output[0] if isinstance(output, tuple) else output
+        flat = h.reshape(-1, h.shape[-1])
+        with torch.no_grad():
+            _, z = sae(flat)
+            z[:, feature_id] = (z[:, feature_id] + delta).clamp(min=0)
+            x_hat = sae._decode(z)
+        x_hat = x_hat.reshape(h.shape)
+        if isinstance(output, tuple):
+            return (x_hat,) + output[1:]
+        return x_hat
+
+    handle = _get_layer(llm, layer_idx).register_forward_hook(_hook)
     try:
         yield
     finally:
