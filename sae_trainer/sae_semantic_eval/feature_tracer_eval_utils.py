@@ -1411,6 +1411,96 @@ def build_feature_persistence_df(
     return combined.reset_index(drop=True)
 
 
+def search_features_by_concept(
+    query: str,
+    tracer: FeatureTracer,
+    top_n: int = 10,
+    model_name: str = "all-MiniLM-L6-v2",
+    search_by: str = "context",
+) -> pd.DataFrame:
+    """
+    Find SAE features whose activating contexts are most semantically similar
+    to a free-text description of a concept.
+
+    Embeds `query` with the same sentence-transformer used in
+    compute_feature_embeddings(), then ranks features by cosine similarity
+    between the query embedding and each feature's mean context or token embedding.
+
+    Requires compute_feature_embeddings() to have been called on the tracer.
+
+    Parameters
+    ----------
+    query      : free-text concept description, e.g. "mathematical equations"
+    tracer     : FeatureTracer with pre-computed feature embeddings
+    top_n      : number of top-matching features to return
+    model_name : sentence-transformer model — must match the one used in
+                 compute_feature_embeddings() (default: "all-MiniLM-L6-v2")
+    search_by  : "context" — rank by similarity to mean context window embedding
+                             (captures surrounding text — good for thematic concepts)
+                 "token"   — rank by similarity to mean token embedding
+                             (captures the activating token type — good for
+                             syntactic or lexical concepts)
+                 "both"    — average of context and token similarity scores
+
+    Returns a DataFrame with columns:
+      feature_id, score, context_sim, token_sim, hits, mean_activation
+    sorted by score descending.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        raise ImportError("pip install sentence-transformers")
+
+    if search_by not in ("context", "token", "both"):
+        raise ValueError("search_by must be 'context', 'token', or 'both'")
+
+    feature_embeddings = tracer.get_feature_embeddings()
+    if not feature_embeddings:
+        raise RuntimeError("Call compute_feature_embeddings() on the tracer first.")
+
+    query_emb = SentenceTransformer(model_name).encode(
+        [query], normalize_embeddings=True, convert_to_numpy=True
+    )[0]  # (d,)
+
+    rows = []
+    for fid, data in feature_embeddings.items():
+        ctx_emb = data["context_embeddings"]   # (n, d), unit-normed
+        tok_emb = data.get("token_embeddings") # (n, d), unit-normed, may be absent
+
+        ctx_mean = ctx_emb.mean(axis=0)
+        ctx_mean /= np.linalg.norm(ctx_mean) + 1e-8
+        ctx_sim = float(ctx_mean @ query_emb)
+
+        tok_sim = float("nan")
+        if tok_emb is not None:
+            tok_mean = tok_emb.mean(axis=0)
+            tok_mean /= np.linalg.norm(tok_mean) + 1e-8
+            tok_sim = float(tok_mean @ query_emb)
+
+        if search_by == "context":
+            score = ctx_sim
+        elif search_by == "token":
+            score = tok_sim if not np.isnan(tok_sim) else ctx_sim
+        else:
+            score = ((ctx_sim + tok_sim) / 2) if not np.isnan(tok_sim) else ctx_sim
+
+        rows.append({
+            "feature_id":      fid,
+            "score":           score,
+            "context_sim":     ctx_sim,
+            "token_sim":       tok_sim,
+            "hits":            len(data["activations"]),
+            "mean_activation": float(data["activations"].mean()),
+        })
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values("score", ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+
+
 def get_feature_firing_by_prompt(
     feature_id: int,
     tracer: FeatureTracer,
