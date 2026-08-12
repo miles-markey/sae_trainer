@@ -184,31 +184,208 @@ class FeatureTracer:
             "num_hits": sum(1 for r in self._rows if r["prompt_id"] == pid),
         }
 
-    def trace_prompts(self, prompts: List[str], ids: Optional[List[str]] = None, system_prompt: Optional[str] = None) -> List[Dict]:
+    def trace_prompts(
+        self,
+        prompts: List[str],
+        ids: Optional[List[str]] = None,
+        system_prompt: Optional[str] = None,
+        batch_size: int = 8,
+    ) -> List[Dict]:
+        prompt_ids = [ids[i] if ids is not None else f"p{i}" for i in range(len(prompts))]
         summaries = []
-        for i, p in enumerate(prompts):
-            pid = ids[i] if ids is not None else f"p{i}"
-            summaries.append(self.trace_prompt(p, prompt_id=pid, system_prompt=system_prompt))
+        for start in range(0, len(prompts), batch_size):
+            summaries.extend(self._trace_batch(
+                prompts[start:start + batch_size],
+                prompt_ids[start:start + batch_size],
+                system_prompt,
+            ))
+        return summaries
+
+    @torch.no_grad()
+    def _trace_batch(
+        self,
+        prompts: List[str],
+        prompt_ids: List,
+        system_prompt: Optional[str] = None,
+    ) -> List[Dict]:
+        """
+        Generate + SAE-extract for a batch of prompts in one forward pass.
+
+        Uses left-padding so all sequences reach the same length. After
+        generation, `token_pos` stored in each row is normalized to the
+        non-padded position (consistent with `trace_prompt`), so
+        `feature_contexts` and all downstream analysis work unchanged.
+        """
+        B = len(prompts)
+
+        orig_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        if system_prompt is not None and getattr(self.tokenizer, "chat_template", None) is not None:
+            per_sample_ids = []
+            for p in prompts:
+                messages = [{"role": "system", "content": system_prompt},
+                            {"role": "user", "content": p}]
+                ids = self.tokenizer.apply_chat_template(
+                    messages, return_tensors="pt", add_generation_prompt=True
+                )[0]
+                per_sample_ids.append(ids)
+            max_len = max(ids.shape[0] for ids in per_sample_ids)
+            pad_id = self.tokenizer.pad_token_id
+            input_ids_t = torch.full((B, max_len), pad_id, dtype=torch.long)
+            attn_mask_t = torch.zeros((B, max_len), dtype=torch.long)
+            for i, ids in enumerate(per_sample_ids):
+                n = ids.shape[0]
+                input_ids_t[i, max_len - n:] = ids
+                attn_mask_t[i, max_len - n:] = 1
+            inputs = {
+                "input_ids": input_ids_t.to(self.device),
+                "attention_mask": attn_mask_t.to(self.device),
+            }
+        else:
+            texts = [f"{system_prompt}\n\n{p}" if system_prompt else p for p in prompts]
+            inputs = self.tokenizer(
+                texts, return_tensors="pt", padding=True, truncation=True, max_length=4096,
+            ).to(self.device)
+
+        self.tokenizer.padding_side = orig_padding_side
+
+        num_prompt_tokens = inputs["input_ids"].shape[1]  # padded prompt length
+        real_prompt_lens = inputs["attention_mask"].sum(dim=1).tolist()
+        pad_lens = [num_prompt_tokens - int(rpl) for rpl in real_prompt_lens]
+
+        self._captured_hidden = []
+        self._register_hook()
+
+        generate_kwargs = dict(
+            max_new_tokens=self.cfg.max_new_tokens,
+            do_sample=self.cfg.do_sample,
+            repetition_penalty=self.cfg.repetition_penalty,
+            pad_token_id=self.tokenizer.eos_token_id,
+            attention_mask=inputs["attention_mask"],
+        )
+        if self.cfg.do_sample:
+            generate_kwargs["temperature"] = self.cfg.temperature
+        if self.cfg.stop_strings:
+            generate_kwargs["stop_strings"] = self.cfg.stop_strings
+            generate_kwargs["tokenizer"] = self.tokenizer
+
+        torch.manual_seed(hash(str(prompt_ids[0])) % (2**32))
+        out = self.llm.generate(inputs["input_ids"], **generate_kwargs)
+
+        self._remove_hook()
+
+        H = torch.cat(self._captured_hidden, dim=1)  # [B, total_seq, d_model]
+        flat = H.reshape(-1, H.shape[-1])
+        sae_out = self.sae(flat)
+        if isinstance(sae_out, tuple):
+            z = sae_out[1]
+        elif isinstance(sae_out, dict):
+            z = sae_out.get("z", sae_out.get("latents", sae_out.get("codes")))
+        else:
+            raise ValueError("Unexpected SAE output format")
+        Z = z.view(B, H.shape[1], -1)  # [B, total_seq, d_latent]
+
+        num_generated = out.shape[1] - num_prompt_tokens
+        summaries = []
+
+        for i, (pid, prompt) in enumerate(zip(prompt_ids, prompts)):
+            pad_len = pad_lens[i]
+            real_prompt_len = int(real_prompt_lens[i])
+
+            token_ids_i = out[i].tolist()
+            tokens_i = self.tokenizer.convert_ids_to_tokens(token_ids_i)
+            text_i = self.tokenizer.decode(out[i][pad_len:], skip_special_tokens=True)
+
+            Zi = Z[i]
+            top_vals, top_idx = torch.topk(
+                Zi, k=min(self.cfg.topk_per_token, Zi.shape[-1]), dim=-1
+            )
+
+            rows_before = len(self._rows)
+
+            for pos in range(pad_len, min(len(tokens_i), Zi.shape[0])):
+                is_prompt_tok = pos < num_prompt_tokens
+                if self.cfg.token_mode == "generated_only" and is_prompt_tok:
+                    continue
+                if self.cfg.token_mode == "prompt_only" and not is_prompt_tok:
+                    continue
+
+                # Normalize out the left-padding so token_pos matches trace_prompt output
+                pos_norm = pos - pad_len
+
+                if self.cfg.token_mode == "all":
+                    token_pos_relative = pos_norm
+                    num_tokens_relative = len(tokens_i) - pad_len
+                elif self.cfg.token_mode == "generated_only":
+                    token_pos_relative = pos - num_prompt_tokens
+                    num_tokens_relative = num_generated
+                else:  # prompt_only
+                    token_pos_relative = pos_norm
+                    num_tokens_relative = real_prompt_len
+
+                for j in range(top_idx.shape[1]):
+                    val = float(top_vals[pos, j])
+                    if val <= self.cfg.min_activation:
+                        continue
+                    self._rows.append({
+                        "prompt_id": pid,
+                        "prompt": prompt,
+                        "generated_text": text_i,
+                        "token_pos": pos_norm,
+                        "token_pos_relative": token_pos_relative,
+                        "num_tokens": len(tokens_i) - pad_len,
+                        "num_tokens_relative": num_tokens_relative,
+                        "token": tokens_i[pos],
+                        "feature_id": int(top_idx[pos, j]),
+                        "activation": val,
+                    })
+
+            summaries.append({
+                "prompt_id": pid,
+                "prompt": prompt,
+                "generated_text": text_i,
+                "num_prompt_tokens": real_prompt_len,
+                "num_tokens": len(tokens_i) - pad_len,
+                "num_hits": len(self._rows) - rows_before,
+            })
+
         return summaries
 
     def trace_prompts_from_iterable_dataset(
-            self,
-            ds,
-            min_prompt_words: int = 50,
-            truncation_limit: int = 150,
-            max_prompts_to_trace: Optional[int] = None,
-            system_prompt: Optional[str] = None,
-            prompt_key: Optional[str] = 'text'
-        ) -> List[Dict]:
-        summaries = []
+        self,
+        ds,
+        min_prompt_words: int = 50,
+        truncation_limit: int = 150,
+        max_prompts_to_trace: Optional[int] = None,
+        system_prompt: Optional[str] = None,
+        prompt_key: Optional[str] = "text",
+        batch_size: int = 8,
+    ) -> List[Dict]:
+        summaries: List[Dict] = []
+        batch_prompts: List[str] = []
+        batch_ids: List[int] = []
         num_traced = 0
+
         for row in ds:
             text = row[prompt_key].strip()
             if len(text.split()) >= min_prompt_words:
-                summaries.append(self.trace_prompt(" ".join(text.split()[:truncation_limit]), prompt_id=num_traced, system_prompt=system_prompt))
+                batch_prompts.append(" ".join(text.split()[:truncation_limit]))
+                batch_ids.append(num_traced)
                 num_traced += 1
+
+                if len(batch_prompts) == batch_size:
+                    summaries.extend(self._trace_batch(batch_prompts, batch_ids, system_prompt))
+                    batch_prompts, batch_ids = [], []
+
             if max_prompts_to_trace and num_traced >= max_prompts_to_trace:
                 break
+
+        if batch_prompts:
+            summaries.extend(self._trace_batch(batch_prompts, batch_ids, system_prompt))
+
         return summaries
 
 
@@ -346,45 +523,60 @@ class FeatureTracer:
         except ImportError:
             raise ImportError("pip install sentence-transformers")
 
-        embed_model = SentenceTransformer(model_name)
+        embed_model = SentenceTransformer(model_name, device=self.device)
 
         df = self.to_dataframe()
         if feature_ids is None:
             feature_ids = df["feature_id"].unique().tolist()
 
-        results = {}
+        # Collect all contexts and tokens across every feature in one pass,
+        # then encode them in two large batches (one for contexts, one for tokens).
+        # This amortizes kernel-launch overhead on MPS/GPU vs. 2×n_features small calls.
+        all_contexts: list[str] = []
+        all_tokens: list[str] = []
+        meta: list[tuple] = []  # (fid, activations, prompt_ids, token_positions, slice_start)
+
         for fid in feature_ids:
             ctx_df = self.feature_contexts(fid, top_n=contexts_per_feature)
             if ctx_df.empty:
                 continue
-
-            contexts = ctx_df["context"].tolist()
-            activations = ctx_df["activation"].to_numpy()
-            prompt_ids = ctx_df["prompt_id"].tolist()
-            token_positions = ctx_df["token_pos"].to_numpy()
-            # Decode BPE tokens to clean strings (e.g. "Ġmilitary" → "military")
-            tokens = [
+            start = len(all_contexts)
+            all_contexts.extend(ctx_df["context"].tolist())
+            all_tokens.extend(
                 self.tokenizer.convert_tokens_to_string([t])
                 for t in ctx_df["token"].tolist()
-            ]
-
-            encode_kwargs = dict(
-                batch_size=batch_size,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
             )
-            embeddings = embed_model.encode(contexts, **encode_kwargs)
-            token_embeddings = embed_model.encode(tokens,   **encode_kwargs)
+            meta.append((
+                fid,
+                ctx_df["activation"].to_numpy(),
+                ctx_df["prompt_id"].tolist(),
+                ctx_df["token_pos"].to_numpy(),
+                start,
+                len(all_contexts),  # exclusive end
+            ))
 
+        if not all_contexts:
+            return {}
+
+        encode_kwargs = dict(
+            batch_size=batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        ctx_embs = embed_model.encode(all_contexts, **encode_kwargs)
+        tok_embs = embed_model.encode(all_tokens,   **encode_kwargs)
+
+        results = {}
+        for fid, activations, prompt_ids, token_positions, s, e in meta:
             results[fid] = {
-                "context_embeddings":       embeddings,
-                "token_embeddings": token_embeddings,
-                "activations":      activations,
-                "contexts":         contexts,
-                "tokens":           tokens,
-                "prompt_ids":       prompt_ids,
-                "token_positions":  token_positions,
+                "context_embeddings": ctx_embs[s:e],
+                "token_embeddings":   tok_embs[s:e],
+                "activations":        activations,
+                "contexts":           all_contexts[s:e],
+                "tokens":             all_tokens[s:e],
+                "prompt_ids":         prompt_ids,
+                "token_positions":    token_positions,
             }
 
         return results
@@ -552,5 +744,26 @@ class FeatureTracer:
         )
 
     
+    def subset(self, prompt_ids: list) -> "FeatureTracer":
+        """
+        Return a new FeatureTracer containing only the rows for the given prompt_ids.
+
+        The new tracer shares the same llm, tokenizer, sae, device, and config but
+        has independent _rows, _feature_embeddings, and _feature_specificity_scores_df,
+        so computing embeddings or scores on it does not affect the original.
+
+        Useful for sweeping dataset size without re-running LLM inference:
+
+            all_pids = tracer.to_dataframe()["prompt_id"].unique().tolist()
+            for n in [100, 250, 500, 1000]:
+                sub = tracer.subset(all_pids[:n])
+                sub.compute_feature_embeddings()
+                sub.feature_specificity_scores()
+        """
+        pid_set = {str(p) for p in prompt_ids}
+        sub = FeatureTracer(self.llm, self.tokenizer, self.sae, self.device, self.cfg)
+        sub._rows = [r for r in self._rows if str(r["prompt_id"]) in pid_set]
+        return sub
+
     def save_csv(self, path: str):
         self.to_dataframe().to_csv(path, index=False)
