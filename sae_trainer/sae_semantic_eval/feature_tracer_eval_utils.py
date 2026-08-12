@@ -1501,6 +1501,71 @@ def search_features_by_concept(
     )
 
 
+def compute_split_half_centroid_stability(
+    tracer: FeatureTracer,
+    seed: int = 42,
+) -> float:
+    """
+    Measure how stable feature centroids are given the current dataset size.
+
+    For each feature, splits its context embeddings into two random halves,
+    computes the mean embedding (centroid) of each half, then returns the
+    mean cosine similarity across all features.
+
+      ~1.0 — centroids are stable; more data unlikely to change them much
+      ~0.7 — moderate instability; more data would help
+      < 0.5 — centroids are unreliable; dataset is too small for this feature
+
+    Features with fewer than 4 activating examples are excluded.
+    """
+    feature_embeddings = tracer.get_feature_embeddings()
+    if not feature_embeddings:
+        raise RuntimeError("Call compute_feature_embeddings() on the tracer first.")
+
+    rng = np.random.default_rng(seed)
+    stabilities = []
+
+    for data in feature_embeddings.values():
+        emb = data["context_embeddings"]  # (n, d), unit-normed
+        n = len(emb)
+        if n < 4:
+            continue
+        idx = rng.permutation(n)
+        h1, h2 = emb[idx[: n // 2]], emb[idx[n // 2 :]]
+        c1 = h1.mean(axis=0); c1 /= np.linalg.norm(c1) + 1e-8
+        c2 = h2.mean(axis=0); c2 /= np.linalg.norm(c2) + 1e-8
+        stabilities.append(float(c1 @ c2))
+
+    return float(np.mean(stabilities)) if stabilities else float("nan")
+
+
+def compute_coverage_metrics(tracer: FeatureTracer, seed: int = 42) -> dict:
+    """
+    Compute a summary of feature coverage and quality for the current tracer state.
+
+    Returns a dict with:
+      n_scored_features         — features that passed min_prompts and were scored
+      mean_composite_score      — average composite score across scored features
+      mean_context_specificity  — average context_specificity_vs_baseline
+      frac_above_threshold      — fraction of scored features with
+                                  context_specificity_vs_baseline > 0.025
+      split_half_stability      — centroid reliability score (see
+                                  compute_split_half_centroid_stability)
+
+    Requires feature_specificity_scores() and compute_feature_embeddings()
+    to have been called on the tracer.
+    """
+    scores = tracer.get_feature_specificity_scores_df()
+    stability = compute_split_half_centroid_stability(tracer, seed=seed)
+    return {
+        "n_scored_features":        len(scores),
+        "mean_composite_score":     float(scores["composite_score"].mean()),
+        "mean_context_specificity": float(scores["context_specificity_vs_baseline"].mean()),
+        "frac_above_threshold":     float((scores["context_specificity_vs_baseline"] > 0.025).mean()),
+        "split_half_stability":     stability,
+    }
+
+
 def get_feature_firing_by_prompt(
     feature_id: int,
     tracer: FeatureTracer,
