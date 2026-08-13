@@ -1501,6 +1501,273 @@ def search_features_by_concept(
     )
 
 
+def build_query_feature_matrix(
+    queries: list[str],
+    tracer: FeatureTracer,
+    n_features: int | None = None,
+    model_name: str = "all-MiniLM-L6-v2",
+    search_by: str = "context",
+    center: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Represent each query string as a dense vector in SAE feature space and return
+    the pairwise cosine similarity matrix between queries.
+
+    For each query, entry i of its feature vector is the cosine similarity between
+    the query embedding and feature i's mean context (or token) embedding.
+    Unobserved features (no activations in the traced dataset) are zero.
+
+    Parameters
+    ----------
+    queries    : list of free-text query strings to compare
+    tracer     : FeatureTracer with pre-computed feature embeddings
+    n_features : SAE latent dimension; defaults to tracer.sae.d_latent
+    model_name : sentence-transformer model — must match compute_feature_embeddings()
+    search_by  : "context", "token", or "both" — which embedding to use per feature
+    center     : if True (default), subtract each feature's mean response across
+                 queries before computing sim_matrix. This removes the shared
+                 positive background caused by sentence-transformer embeddings
+                 clustering in a positive cone, so sim_matrix reflects only
+                 differential feature activation rather than absolute similarity.
+                 Set to False to recover the raw cosine similarities.
+
+    Returns
+    -------
+    feature_matrix : np.ndarray, shape (n_queries, n_features)
+        Row i is the cosine similarity of query i against every SAE feature centroid
+        (before centering).
+    sim_matrix     : np.ndarray, shape (n_queries, n_queries)
+        Pairwise cosine similarity between queries in feature space, computed on
+        the centered feature matrix when center=True.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        raise ImportError("pip install sentence-transformers")
+
+    if search_by not in ("context", "token", "both"):
+        raise ValueError("search_by must be 'context', 'token', or 'both'")
+
+    feature_embeddings = tracer.get_feature_embeddings()
+    if not feature_embeddings:
+        raise RuntimeError("Call compute_feature_embeddings() on the tracer first.")
+
+    if n_features is None:
+        n_features = tracer.sae.d_latent
+
+    import torch
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    embed_model = SentenceTransformer(model_name, device=device)
+
+    # Embed all queries in one batch
+    Q = embed_model.encode(
+        queries,
+        batch_size=64,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    ).astype(np.float32)  # (n_queries, d_embed)
+
+    d_embed = Q.shape[1]
+
+    # Build feature centroid matrix C: (n_features, d_embed)
+    # Each row is the L2-normalised mean embedding of that feature's activating contexts.
+    # Rows for unobserved features remain zero.
+    C = np.zeros((n_features, d_embed), dtype=np.float32)
+    for fid, data in feature_embeddings.items():
+        if fid >= n_features:
+            continue
+        ctx_emb = data["context_embeddings"]
+        tok_emb = data.get("token_embeddings")
+
+        if search_by == "context" or tok_emb is None:
+            emb = ctx_emb
+        elif search_by == "token":
+            emb = tok_emb
+        else:  # both
+            emb = np.concatenate([ctx_emb, tok_emb], axis=0)
+
+        centroid = emb.mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm > 1e-8:
+            C[fid] = centroid / norm
+
+    # feature_matrix[i, f] = cosine sim between query i and feature f
+    feature_matrix = (Q @ C.T).astype(np.float32)  # (n_queries, n_features)
+
+    # Pairwise query-query cosine similarity in feature space.
+    # Center column-wise first to remove the shared positive background that
+    # inflates similarity between unrelated queries (sentence-transformer cone effect).
+    vectors = feature_matrix - feature_matrix.mean(axis=0, keepdims=True) if center else feature_matrix
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True).clip(min=1e-8)
+    normed = vectors / norms
+    sim_matrix = (normed @ normed.T).astype(np.float32)  # (n_queries, n_queries)
+
+    return feature_matrix, sim_matrix
+
+
+def compare_query_differences(
+    feature_matrix: np.ndarray,
+    queries: list[str],
+    pairs: list[tuple] | None = None,
+) -> tuple[np.ndarray, list[str], np.ndarray]:
+    """
+    Compute difference vectors between pairs of queries in SAE feature space,
+    then measure cosine similarity between those differences.
+
+    Answers analogy questions like: "Is the direction Good → Great conceptually
+    similar to Bad → Terrible?" — i.e. do both pairs differ along the same
+    SAE features (e.g. features encoding sentiment intensity)?
+
+    Difference vectors naturally cancel the shared positive background, so no
+    centering is needed (unlike sim_matrix in build_query_feature_matrix).
+
+    Parameters
+    ----------
+    feature_matrix : (n_queries, n_features) array from build_query_feature_matrix
+    queries        : query strings in the same order as feature_matrix rows
+    pairs          : list of (from, to) tuples; each element may be a query
+                     string or an integer index into `queries`.
+                     If None, uses all ordered pairs (i, j) where i < j.
+
+    Returns
+    -------
+    diff_matrix  : np.ndarray, shape (n_pairs, n_features)
+        Row k is feature_matrix[to_k] - feature_matrix[from_k].
+    pair_labels  : list of "from → to" strings, one per row of diff_matrix.
+    sim_matrix   : np.ndarray, shape (n_pairs, n_pairs)
+        Pairwise cosine similarity between difference vectors.
+        sim_matrix[i, j] near 1  — pairs i and j shift along the same features
+        sim_matrix[i, j] near -1 — pairs shift in opposite directions
+        sim_matrix[i, j] near 0  — pairs differ along unrelated features
+
+    Example
+    -------
+    feature_matrix, _ = build_query_feature_matrix(
+        ["Good", "Great", "Bad", "Terrible"], tracer
+    )
+    _, labels, sim = compare_query_differences(
+        feature_matrix,
+        ["Good", "Great", "Bad", "Terrible"],
+        pairs=[("Good", "Great"), ("Bad", "Terrible")],
+    )
+    # sim[0, 1] close to 1 → both pairs shift along the same "intensity" features
+    """
+    n = len(queries)
+    q_to_idx = {q: i for i, q in enumerate(queries)}
+
+    def _resolve(p):
+        if isinstance(p, str):
+            if p not in q_to_idx:
+                raise ValueError(f"Query {p!r} not found in queries list.")
+            return q_to_idx[p]
+        return int(p)
+
+    if pairs is None:
+        resolved = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    else:
+        resolved = [(_resolve(a), _resolve(b)) for a, b in pairs]
+
+    pair_labels = [f"{queries[a]} → {queries[b]}" for a, b in resolved]
+
+    diff_matrix = np.stack(
+        [feature_matrix[b] - feature_matrix[a] for a, b in resolved]
+    ).astype(np.float32)  # (n_pairs, n_features)
+
+    norms = np.linalg.norm(diff_matrix, axis=1, keepdims=True).clip(min=1e-8)
+    normed = diff_matrix / norms
+    sim_matrix = (normed @ normed.T).astype(np.float32)  # (n_pairs, n_pairs)
+
+    return diff_matrix, pair_labels, sim_matrix
+
+
+def explain_difference_similarity(
+    diff_matrix: np.ndarray,
+    pair_labels: list[str],
+    pair_i: int | str,
+    pair_j: int | str,
+    tracer: FeatureTracer,
+    top_n: int = 20,
+) -> pd.DataFrame:
+    """
+    Decompose the cosine similarity between two difference vectors into
+    per-feature contributions.
+
+    The cosine similarity between normalised difference vectors n1 and n2 equals
+    the sum over features of n1[f] * n2[f], so each term is that feature's
+    additive contribution to the total similarity score.
+
+    Parameters
+    ----------
+    diff_matrix  : (n_pairs, n_features) from compare_query_differences
+    pair_labels  : label strings from compare_query_differences
+    pair_i       : index or label string for the first pair (e.g. "Good → Great")
+    pair_j       : index or label string for the second pair (e.g. "Bad → Terrible")
+    tracer       : FeatureTracer — used to add hit counts and mean activations
+    top_n        : number of top-contributing features to return (sorted by
+                   abs contribution, positive contributors first then negative)
+
+    Returns
+    -------
+    DataFrame with columns:
+      feature_id   — SAE feature index
+      contribution — additive contribution to cosine similarity (sums to sim score)
+      delta_i      — raw feature delta for pair_i  (positive = increased)
+      delta_j      — raw feature delta for pair_j
+      hits         — number of times feature fired across all traced prompts
+      mean_activation
+    Sorted by contribution descending (most aligned features first).
+    """
+    label_to_idx = {lbl: i for i, lbl in enumerate(pair_labels)}
+
+    def _resolve(p):
+        if isinstance(p, str):
+            if p not in label_to_idx:
+                raise ValueError(f"Pair label {p!r} not found. Available: {pair_labels}")
+            return label_to_idx[p]
+        return int(p)
+
+    i, j = _resolve(pair_i), _resolve(pair_j)
+    d1, d2 = diff_matrix[i], diff_matrix[j]
+
+    n1 = d1 / (np.linalg.norm(d1) + 1e-8)
+    n2 = d2 / (np.linalg.norm(d2) + 1e-8)
+    contributions = (n1 * n2).astype(np.float32)  # (n_features,) — sums to cosine sim
+
+    # Pull hit counts and mean activations from the tracer
+    stats = (
+        tracer.to_dataframe()
+        .groupby("feature_id")
+        .agg(hits=("activation", "count"), mean_activation=("activation", "mean"))
+        .reset_index()
+    )
+    stats_map = {row.feature_id: row for row in stats.itertuples()}
+
+    nonzero = np.flatnonzero(contributions)
+    rows = []
+    for fid in nonzero:
+        s = stats_map.get(int(fid))
+        rows.append({
+            "feature_id":       int(fid),
+            "contribution":     float(contributions[fid]),
+            "delta_i":          float(d1[fid]),
+            "delta_j":          float(d2[fid]),
+            "hits":             int(s.hits) if s else 0,
+            "mean_activation":  float(s.mean_activation) if s else float("nan"),
+        })
+
+    df = (
+        pd.DataFrame(rows)
+        .sort_values("contribution", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    # Return top_n positive + top_n negative contributors
+    top_pos = df.head(top_n)
+    top_neg = df.tail(top_n).sort_values("contribution")
+    return pd.concat([top_pos, top_neg]).drop_duplicates("feature_id").reset_index(drop=True)
+
+
 def compute_split_half_centroid_stability(
     tracer: FeatureTracer,
     seed: int = 42,
