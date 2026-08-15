@@ -126,6 +126,7 @@ def sae_regularized_finetune(
     device: str = "mps",
     log_every: int = 10,
     eval_sae_drift_every: Optional[int] = None,
+    run=None
 ) -> dict:
     """
     Fine-tune an LLM with a frozen SAE used as a feature-space regulariser.
@@ -271,9 +272,15 @@ def sae_regularized_finetune(
                     f"  total={loss.item():.4f}"
                     f"  {feat_str}"
                 )
+                if run:
+                    run.log({
+                        "train/ce_loss": L_CE.item(),
+                        "train/sae_loss": L_SAE.item(),
+                        "train/total_loss": loss.item(),
+                    })
 
     sae.requires_grad_(True)
-    return history
+    return llm, history
 
 
 @contextmanager
