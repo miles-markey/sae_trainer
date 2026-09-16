@@ -17,8 +17,6 @@ import wandb
 
 from ..core.dataset_utils import make_collate_fn, TextDataset, get_data_loaders
 from .sae_training_module import ReluSAETrainingModule, TopKSAETrainingModule
-from ..sae_semantic_eval.eval_utils import evaluate_sae, visualize_sae
-from ..core.model_utils import ReluSparseAutoencoder, TopKSparseAutoencoder
 from .activation_collector_utils import GPT2ActivationCollector, QwenActivationCollector
 
 def load_config(path: str) -> SimpleNamespace:

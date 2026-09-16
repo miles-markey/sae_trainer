@@ -6,9 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-from ..core.model_utils import firing_rate_kl_loss
-
-
 def evaluate(
     model,
     loader,
