@@ -174,8 +174,9 @@ def sae_regularized_finetune(
     optimizer = AdamW(llm.parameters(), lr=lr)
 
     target_fids = list(target_features.keys())
+    model_dtype = next(llm.parameters()).dtype
     target_vals = torch.tensor(
-        [target_features[f] for f in target_fids], dtype=torch.float32, device=device
+        [target_features[f] for f in target_fids], dtype=model_dtype, device=device
     )  # (n_target_features,)
 
     history: dict = {

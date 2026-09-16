@@ -71,6 +71,10 @@ def finetune(cfg, args, device):
     llm, tokenizer, _ = get_model(cfg, device)
     sae = get_sae(cfg, device=device)
 
+    # cast both llm and sae to float16
+    #llm = llm.to(torch.float16)
+    #sae = sae.to(torch.float16)
+
     train_texts = get_training_texts(cfg)
 
     llm, history = sae_regularized_finetune(
@@ -83,7 +87,8 @@ def finetune(cfg, args, device):
         batch_size=cfg.batch_size,
         eval_sae_drift_every=cfg.eval_sae_drift_every,
         max_length=cfg.max_length,
-        lr=cfg.lr
+        lr=cfg.lr,
+        run=run
     )
 
     if run:
