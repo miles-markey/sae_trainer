@@ -12,3 +12,4 @@ configs/
 !configs/qwen05_baseline.yaml
 !model_weights_files/topk_sae_qwen_openwebtext_layer12.pt
 notebooks/playground.ipynb
+.ipynb_checkpoints/

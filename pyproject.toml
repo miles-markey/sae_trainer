@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 # Install groups with: `uv sync --group subset` or `uv sync --group full`
 # (see [tool.uv.default-groups] for what bare `uv sync` installs.)
-dependencies = []
+dependencies = [
+    "hdbscan>=0.8.40",
+]
 
 [build-system]
 requires = ["hatchling>=1.23.0"]
@@ -41,6 +43,11 @@ full = [
     { include-group = "subset" },
     "umap-learn==0.5.7",
     "scikit-learn<1.6",
+]
+dev = [
+    "jupyter>=1.1.1",
+    "ollama>=0.6.3",
+    "pandas>=2.2.3",
 ]
 
 [tool.uv]

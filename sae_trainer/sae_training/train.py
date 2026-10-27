@@ -89,8 +89,11 @@ def get_model(cfg, device):
     elif cfg.model_name == "qwen":
         model_name = "Qwen/Qwen2-0.5B-Instruct"
         collector = QwenActivationCollector
+    elif cfg.model_name == "qwen-7b":
+        model_name = "Qwen/Qwen2.5-7B-Instruct"
+        collector = QwenActivationCollector
     else:
-        raise ValueError(f"Invalid model name: {cfg.model_name}. Expected 'gpt2' or 'qwen'.")    
+        raise ValueError(f"Invalid model name: {cfg.model_name}. Expected 'gpt2', 'qwen', or 'qwen-7b.")    
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:

@@ -1909,7 +1909,7 @@ def build_prompt_feature_spectrum(
     """
     pid = str(prompt_id)
     df = tracer.to_dataframe()
-    df_pid = df[df["prompt_id"] == pid].copy()
+    df_pid = df[df["prompt_id"].astype(str) == pid].copy()
 
     full_index = pd.DataFrame({"feature_id": range(n_features)})
 
@@ -1975,7 +1975,7 @@ def build_token_feature_spectrum(
     """
     pid = str(prompt_id)
     df = tracer.to_dataframe()
-    df_pid = df[df["prompt_id"] == pid]
+    df_pid = df[df["prompt_id"].astype(str) == pid]
 
     if df_pid.empty:
         return pd.DataFrame(columns=range(n_features), dtype=float)

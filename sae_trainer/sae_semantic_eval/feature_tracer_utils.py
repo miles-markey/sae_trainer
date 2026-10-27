@@ -579,6 +579,7 @@ class FeatureTracer:
                 "token_positions":    token_positions,
             }
 
+        self._feature_embeddings = results
         return results
 
     def feature_specificity_scores(
