@@ -2,7 +2,7 @@
 
 See demo at: https://miles-markey.github.io/sae_trainer/
 
-This package is divided into two useful use cases: training (in the “sae_training/” directory and) sae evaluation (in the “sae_semantic_eval/”) directory.
+This package is divided into two useful use cases: training (in the “sae_training/” directory and) sae evaluation (in the “sae_semantic_eval/”) directory. Shared modules used by both use cases are located in the "core/" directory.
 
 ## sae_training
 
