@@ -99,10 +99,10 @@ def get_model(cfg, device):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
-    model.eval()
+    llm = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+    llm.eval()
 
-    return model, tokenizer, collector
+    return llm, tokenizer, collector
 
 def get_dataloader(cfg, tokenizer):
     texts = []
@@ -174,11 +174,11 @@ def collect_activations(loader, collector, target_layers, device, max_batches=50
 def train(cfg, args, device):
     save_mode = args.save_saes
 
-    model, tokenizer, collector_class = get_model(cfg, device)
+    llm, tokenizer, collector_class = get_model(cfg, device)
 
     loader = get_dataloader(cfg, tokenizer)
 
-    collector = collector_class(model=model, layer_ids=cfg.target_layer_idxs)
+    collector = collector_class(model=llm, layer_ids=cfg.target_layer_idxs)
     target_layers = collector.get_layers()
     collector.register()
 
